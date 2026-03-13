@@ -6,15 +6,18 @@
 #include <stdexcept>
 #include <iomanip>
 #include <random>
-#include <numeric> // For std::iota
+#include <numeric>
 #include <cmath>
 #include <cstring>
 #include <algorithm>
 #include <cctype>
-#include <thread> // For multi-threading
-#include <atomic> // For thread-safe counters
-#include <mutex>  // For thread safety (though we'll use atomic/reduction)
-#include <vector>
+#include <thread>
+#include <atomic>
+#include <mutex>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 // Define software version
 const std::string HYPERMASH_VERSION = "1.0";
@@ -74,7 +77,7 @@ public:
             throw std::invalid_argument("Dimensions must be a multiple of 8 for bit-packing.");
         }
     }
-    
+
     // Parallelized encoding function (MapReduce)
     MemoryBank encode_single(const std::string& genome, unsigned int num_threads) {
         if (genome.length() < static_cast<size_t>(k + 1)) {
@@ -82,10 +85,7 @@ public:
         }
 
         std::vector<std::thread> threads;
-        std::vector<MemoryBank> local_banks(num_threads);
-        for (auto& bank : local_banks) {
-            bank.resize(M, Hypervector(D, 0));
-        }
+        std::vector<MemoryBank> local_banks(num_threads, MemoryBank(M, Hypervector(D, 0)));
 
         size_t total_len = genome.length() - (k + 1);
         size_t chunk_size = (total_len + num_threads - 1) / num_threads;
@@ -100,9 +100,17 @@ public:
 
                 MemoryBank& local_bank = local_banks[t];
                 for (size_t i = start; i <= end; ++i) {
-                    std::string source_kmer = get_canonical(genome.substr(i, k));
-                    std::string target_kmer = get_canonical(genome.substr(i + 1, k));
-                    
+                    std::string source_kmer = genome.substr(i, k);
+                    std::string target_kmer = genome.substr(i + 1, k);
+
+                    // Skip if the kmer crosses a scaffold boundary (marked by 'N')
+                    if (source_kmer.find('N') != std::string::npos || target_kmer.find('N') != std::string::npos) {
+                        continue;
+                    }
+
+                    source_kmer = get_canonical(source_kmer);
+                    target_kmer = get_canonical(target_kmer);
+
                     Hypervector target_hv = get_hypervector(target_kmer, D);
                     size_t source_index = deterministic_hash(source_kmer) % M;
                     bundle_inplace(local_bank[source_index], target_hv);
@@ -121,7 +129,7 @@ public:
             threads.emplace_back([&, t]() {
                 size_t start_row = t * rows_chunk_size;
                 size_t end_row = std::min(start_row + rows_chunk_size, M);
-                
+
                 for (size_t i = start_row; i < end_row; ++i) {
                     // Bundle all local banks for this row into the final bank
                     for (const auto& local_bank : local_banks) {
@@ -131,7 +139,7 @@ public:
             });
         }
         for (auto& t : threads) t.join();
-        
+
         return final_bank;
     }
 
@@ -146,18 +154,17 @@ public:
         double current_best_error = initial_error_rate;
 
         for (int iter = 0; iter < max_iterations; ++iter) {
-            
             // --- PRE-CALCULATION PHASE ---
             // Calculate dynamic thresholds for every bucket based on its population density
             std::vector<double> bucket_thresholds(M);
             double sqrt_D = std::sqrt(static_cast<double>(D));
-            
+
             // This loop is fast enough to run serially
             for(size_t i = 0; i < M; ++i) {
                 double magnitude = 0.0;
                 for(int val : bank[i]) magnitude += val * val;
                 magnitude = std::sqrt(magnitude);
-                
+
                 if (magnitude == 0) {
                     bucket_thresholds[i] = 1.0; 
                 } else {
@@ -167,11 +174,7 @@ public:
             }
 
             std::vector<std::thread> threads;
-            std::vector<MemoryBank> local_deltas(num_threads);
-            // Initialize deltas
-            for (auto& delta : local_deltas) {
-                delta.resize(M, Hypervector(D, 0));
-            }
+            std::vector<MemoryBank> local_deltas(num_threads, MemoryBank(M, Hypervector(D, 0)));
 
             size_t total_len = genome.length() - (k + 1);
             size_t chunk_size = (total_len + num_threads - 1) / num_threads;
@@ -184,19 +187,24 @@ public:
                     if (start >= total_len) return;
 
                     MemoryBank& local_delta = local_deltas[t];
-                    
+
                     for (size_t i = start; i <= end; ++i) {
-                        std::string source_kmer = get_canonical(genome.substr(i, k));
-                        std::string target_kmer = get_canonical(genome.substr(i + 1, k));
+                        std::string source_kmer = genome.substr(i, k);
+                        std::string target_kmer = genome.substr(i + 1, k);
+
+                        if (source_kmer.find('N') != std::string::npos || target_kmer.find('N') != std::string::npos) continue;
+
+                        source_kmer = get_canonical(source_kmer);
+                        target_kmer = get_canonical(target_kmer);
 
                         size_t source_index = deterministic_hash(source_kmer) % M;
-                        
+
                         const Hypervector& current_vec = bank[source_index];
                         Hypervector target_hv = get_hypervector(target_kmer, D);
-                        
+
                         double sim = cosine_similarity(current_vec, target_hv);
-                        
-                        // Use the DYNAMIC threshold specific to this bucket
+
+                        // Use the dynamic threshold specific to this bucket
                         if (sim < bucket_thresholds[source_index]) {
                              bundle_inplace(local_delta[source_index], target_hv);
                         }
@@ -208,12 +216,12 @@ public:
             // REDUCE PHASE: Apply deltas to main bank
             threads.clear();
             size_t rows_chunk_size = (M + num_threads - 1) / num_threads;
-            
+
             for (unsigned int t = 0; t < num_threads; ++t) {
                 threads.emplace_back([&, t]() {
                     size_t start_row = t * rows_chunk_size;
                     size_t end_row = std::min(start_row + rows_chunk_size, M);
-                    
+
                     for (size_t i = start_row; i < end_row; ++i) {
                         for (const auto& local_delta : local_deltas) {
                              bundle_inplace(bank[i], local_delta[i]);
@@ -222,14 +230,14 @@ public:
                 });
             }
             for (auto& t : threads) t.join();
-            
+
             // --- EVALUATION PHASE ---
             // Calculate new fidelity to check for improvement
             double new_fidelity = calculate_sketch_fidelity(bank, genome, k, M, D, num_threads);
             double new_error = 1.0 - new_fidelity;
-            
+
             std::cout << "  - Iteration " << (iter + 1) << ": Error Rate " << new_error;
-            
+
             if (new_error >= current_best_error) {
                 std::cout << " -> No improvement (Prev: " << current_best_error << "). Stopping early." << std::endl;
                 break;
@@ -251,7 +259,7 @@ public:
         }
         return vec;
     }
-    
+
     // Parallelized comparison function
     static double compare_sketches(const MemoryBank& bank1, const MemoryBank& bank2, unsigned int num_threads) {
         if (bank1.size() != bank2.size() || bank1.empty()) return 0.0;
@@ -260,7 +268,7 @@ public:
         // Use atomics for simple, lock-free reduction
         std::atomic<double> total_cosine_similarity{0.0};
         std::atomic<int> active_slots{0};
-        
+
         std::vector<std::thread> threads;
         size_t chunk_size = (M + num_threads - 1) / num_threads;
 
@@ -268,13 +276,16 @@ public:
             threads.emplace_back([&, t]() {
                 size_t start = t * chunk_size;
                 size_t end = std::min(start + chunk_size, M);
-                
+
                 double local_similarity = 0.0;
                 int local_active_slots = 0;
 
                 for (size_t i = start; i < end; ++i) {
                     bool b1_zero = std::all_of(bank1[i].begin(), bank1[i].end(), [](int v){ return v == 0; });
                     bool b2_zero = std::all_of(bank2[i].begin(), bank2[i].end(), [](int v){ return v == 0; });
+
+                    // Only compare if at least one bucket is not empty.
+                    // If one is empty and the other isn't, cosine_similarity safely returns 0.
                     if (!b1_zero || !b2_zero) {
                         local_active_slots++;
                         local_similarity += cosine_similarity(bank1[i], bank2[i]);
@@ -284,7 +295,7 @@ public:
                 // Atomically add the local sums to the global totals
                 double current_sim = total_cosine_similarity.load(std::memory_order_relaxed);
                 while (!total_cosine_similarity.compare_exchange_weak(current_sim, current_sim + local_similarity, std::memory_order_relaxed));
-                
+
                 active_slots += local_active_slots;
             });
         }
@@ -293,7 +304,7 @@ public:
         if (active_slots == 0) return 1.0;
         return total_cosine_similarity / active_slots;
     }
-    
+
     // Parallelized fidelity calculation
     static double calculate_sketch_fidelity(const MemoryBank& bank, const std::string& genome, int k, size_t M, int D, unsigned int num_threads) {
         size_t len = genome.length();
@@ -301,7 +312,7 @@ public:
 
         size_t total_edges = len - k;
         std::atomic<double> total_normalized_similarity{0.0};
-        
+
         std::vector<std::thread> threads;
         size_t chunk_size = (total_edges + num_threads - 1) / num_threads;
 
@@ -310,12 +321,16 @@ public:
                 size_t start = t * chunk_size;
                 size_t end = std::min(start + chunk_size, total_edges);
                 if (start >= total_edges) return;
-                
+
                 double local_similarity = 0.0;
 
                 for (size_t i = start; i <= end; ++i) {
-                    std::string source_kmer = get_canonical(genome.substr(i, k));
-                    std::string target_kmer = get_canonical(genome.substr(i + 1, k));
+                    std::string source_kmer = genome.substr(i, k);
+                    std::string target_kmer = genome.substr(i + 1, k);
+                    if (source_kmer.find('N') != std::string::npos || target_kmer.find('N') != std::string::npos) continue;
+
+                    source_kmer = get_canonical(source_kmer);
+                    target_kmer = get_canonical(target_kmer);
 
                     size_t source_index = deterministic_hash(source_kmer) % M;
                     const Hypervector& bundled_vec = bank[source_index];
@@ -324,7 +339,7 @@ public:
                     double sim = cosine_similarity(bundled_vec, target_hv);
                     local_similarity += (sim + 1.0) / 2.0;
                 }
-                
+
                 double current_sim = total_normalized_similarity.load(std::memory_order_relaxed);
                 while (!total_normalized_similarity.compare_exchange_weak(current_sim, current_sim + local_similarity, std::memory_order_relaxed));
             });
@@ -341,11 +356,10 @@ private:
     int k, D;
     size_t M;
 
-    // This function is now const, as it should be.
     void bundle_inplace(Hypervector& v1, const Hypervector& v2) const {
         for (size_t i = 0; i < v1.size(); ++i) v1[i] += v2[i];
     }
-    
+
     static double cosine_similarity(const Hypervector& v1, const Hypervector& v2) {
         double dot = 0.0, mag1_sq = 0.0, mag2_sq = 0.0;
         for(size_t i = 0; i < v1.size(); ++i) {
@@ -371,14 +385,13 @@ struct HypermashHeader {
     char source_file[256]; // Replaced num_genomes with single source file
 };
 
-// Simplified save_sketch, no longer takes ColorMap
 void save_sketch(const MemoryBank& bank, const std::string& filepath, const HypermashHeader& header) {
     std::ofstream outfile(filepath, std::ios::binary);
     if (!outfile) throw std::runtime_error("Cannot open file for writing: " + filepath);
-    
+
     // Write the simplified header
     outfile.write(reinterpret_cast<const char*>(&header), sizeof(HypermashHeader));
-    
+
     if (bank.empty()) return;
 
     size_t packed_vec_size = header.D / 8;
@@ -392,11 +405,10 @@ void save_sketch(const MemoryBank& bank, const std::string& filepath, const Hype
     }
 }
 
-// Simplified load_sketch, no longer returns ColorMap
 MemoryBank load_sketch(const std::string& filepath, HypermashHeader& header) {
     std::ifstream infile(filepath, std::ios::binary);
     if (!infile) throw std::runtime_error("Cannot open file for reading: " + filepath);
-    
+
     infile.read(reinterpret_cast<char*>(&header), sizeof(HypermashHeader));
     if (header.magic_number != 0x484D5348) throw std::runtime_error("Not a valid Hypermash (.hms) file.");
 
@@ -408,20 +420,45 @@ MemoryBank load_sketch(const std::string& filepath, HypermashHeader& header) {
     for (size_t i = 0; i < header.M; ++i) {
         infile.read(reinterpret_cast<char*>(packed_vec.data()), packed_vec_size);
         if(!infile.good()) throw std::runtime_error("Unexpected end of file while reading sketch data.");
+
+        // A truly empty bucket is saved as entirely 0s.
+        // Binarized normal vectors have virtually a 0% chance of being entirely 0s.
+        // We use all-0s as "empty bucket".
+        bool is_empty = true;
+        for (uint8_t byte : packed_vec) {
+            if (byte != 0) {
+                is_empty = false;
+                break;
+            }
+        }
+
         for (int j = 0; j < header.D; ++j) {
-            bank[i][j] = ((packed_vec[j / 8] >> (j % 8)) & 1) ? 1 : -1;
+            if (is_empty) {
+                bank[i][j] = 0; // Keep the bucket properly empty
+            } else {
+                bank[i][j] = ((packed_vec[j / 8] >> (j % 8)) & 1) ? 1 : -1;
+            }
         }
     }
     return bank;
 }
 
-
 std::string read_genome_from_fasta(const std::string& filepath) {
     std::ifstream file(filepath);
     if (!file) throw std::runtime_error("Could not open FASTA file " + filepath);
     std::string genome, line;
+
     while (std::getline(file, line)) {
-        if (line.empty() || line[0] == '>') continue;
+        if (line.empty()) continue;
+
+        if (line[0] == '>') {
+            // Multi-scaffold Support. Add 'N' to break edges between scaffolds.
+            if (!genome.empty() && genome.back() != 'N') {
+                genome += "N"; 
+            }
+            continue;
+        }
+
         line.erase(std::remove_if(line.begin(), line.end(), ::isspace), line.end());
         for (char &c : line) { c = toupper(c); }
         genome += line;
@@ -448,23 +485,22 @@ void print_help() {
               << "  info        Display metadata and information about a sketch file.\n"
               << "  version     Print the software version.\n"
               << "  help        Show this help message.\n\n"
-               << "Options:\n"
+              << "Options:\n"
               << "  -k <int>    K-mer size (default: 9)\n"
-              << "  -d <int>    Hypervector dimensions (must be multiple of 8, default: 10008)\n"
+              << "  -d <int>    Hypervector dimensions (must be multiple of 8, default: 10000)\n"
               << "  -m <int>    Memory bank size (default: 4096)\n"
               << "  -t <int>    Number of threads (default: all available cores)\n"
               << "  -r <int>    Retraining iterations for error mitigation (default: 0)\n"
               << "  -o <file>   Output file prefix (for sketch command)\n";
 }
 
-// handle_sketch now parses thread count
 void handle_sketch(const std::vector<std::string>& args) {
     std::string input_file;
     std::string output_file;
-    int k = 9, D = 10008;
+    int k = 9, D = 10000;
     size_t M = 4096;
     unsigned int num_threads = get_default_threads();
-    int iterations = 0; // Default 0 as per user choice to only warn if used, but user said "do it" so they will use the flag.
+    int iterations = 0;
 
     size_t i = 2;
     while (i < args.size()) {
@@ -480,11 +516,11 @@ void handle_sketch(const std::vector<std::string>& args) {
         }
         i++;
     }
-    
+
     if (D % 8 != 0) throw std::runtime_error("Dimensions (-d) must be a multiple of 8.");
     if (input_file.empty()) throw std::runtime_error("No input FASTA file provided.");
     if (num_threads == 0) throw std::runtime_error("Thread count must be at least 1.");
-    
+
     if (output_file.empty()) {
         std::string basename = input_file;
         size_t pos = basename.find_last_of(".");
@@ -493,25 +529,24 @@ void handle_sketch(const std::vector<std::string>& args) {
     }
 
     HashedGraphEncoder encoder(k, D, M);
-    
+
     std::cout << "Creating single sketch for " << input_file << " using " << num_threads << " thread(s)..." << std::endl;
     std::string genome = read_genome_from_fasta(input_file);
-    MemoryBank bank = encoder.encode_single(genome, num_threads); // Pass thread count
+    MemoryBank bank = encoder.encode_single(genome, num_threads);
 
     std::cout << "Sketch complete. Calculating initial fidelity..." << std::endl;
-    
+
     double fidelity_score = HashedGraphEncoder::calculate_sketch_fidelity(bank, genome, k, M, D, num_threads);
     double error_rate = 1.0 - fidelity_score;
-    
+
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "  Fidelity Score: " << fidelity_score << "\n"
               << "  Error Rate:     " << error_rate << std::endl;
-    
+
     if (iterations > 0) {
         // Pass the initial error rate to allow for early stopping comparison
         encoder.refine_sketch(bank, genome, iterations, num_threads, error_rate);
-        
-        // Final recalculation is now handled/reported inside refine_sketch, but we print final confirmation here
+
         std::cout << "Retraining complete." << std::endl;
     }
 
@@ -525,13 +560,12 @@ void handle_sketch(const std::vector<std::string>& args) {
     std::cout << "Sketch saved successfully." << std::endl;
 }
 
-// handle_dist now parses thread count and outputs SIMILARITY
 void handle_dist(const std::vector<std::string>& args) {
     if (args.size() < 4) throw std::runtime_error("dist command requires two sketch files.");
-    
+
     std::string file1, file2;
     unsigned int num_threads = get_default_threads();
-    
+
     for (size_t i = 2; i < args.size(); ++i) {
         if (args[i] == "-t" && i + 1 < args.size()) {
             num_threads = std::stoi(args[++i]);
@@ -554,28 +588,37 @@ void handle_dist(const std::vector<std::string>& args) {
     if (h1.k != h2.k || h1.D != h2.D || h1.M != h2.M) {
         throw std::runtime_error("Sketch parameters do not match. Cannot compare sketches with different k, D, or M values.");
     }
-    
-    std::cout << "Comparing sketches using " << num_threads << " thread(s)..." << std::endl;
-    // Pass thread count
+
     double sim = HashedGraphEncoder::compare_sketches(b1, b2, num_threads);
-    // Output raw similarity (1.0 = Identical) as requested for ANI correlation
-    std::cout << std::fixed << std::setprecision(6) << sim << std::endl;
+
+    // Reverse mathematical translation to approximate Mash Distance directly.
+    // HDC Cosine Similarity scales as (2 / PI) * arcsin(Jaccard)
+    double estimated_jaccard = std::sin(sim * M_PI / 2.0);
+
+    double mash_dist = 1.0; 
+    if (estimated_jaccard > 0.0) {
+        if (estimated_jaccard >= 1.0) mash_dist = 0.0;
+        else mash_dist = -1.0 / h1.k * std::log(estimated_jaccard);
+    }
+
+    std::cout << "Raw HDC Similarity: " << sim << std::endl;
+    std::cout << "Estimated Jaccard:  " << estimated_jaccard << std::endl;
+    std::cout << "Est. Mash Distance: " << mash_dist << std::endl;
 }
 
-// Simplified handle_info
 void handle_info(const std::vector<std::string>& args) {
     if (args.size() != 3) throw std::runtime_error("info command requires exactly one sketch file.");
     std::string file = args[2];
     HypermashHeader header;
-    
+
     load_sketch(file, header); 
-    
+
     std::cout << "--- Hypermash Sketch Info ---\n"
-              << "File Path:          " << file << "\n"
-              << "Sketch Version:     " << header.version << "\n"
+              << "File Path:            " << file << "\n"
+              << "Sketch Version:       " << header.version << "\n"
               << "--- Parameters ---\n"
-              << "k-mer size (k):     " << header.k << "\n"
-              << "Dimensions (D):     " << header.D << "\n"
+              << "k-mer size (k):       " << header.k << "\n"
+              << "Dimensions (D):       " << header.D << "\n"
               << "Memory Bank Size (M): " << header.M << "\n"
               << "--- Source File ---\n" 
               << "- " << header.source_file << "\n";
