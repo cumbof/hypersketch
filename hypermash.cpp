@@ -803,7 +803,7 @@ unsigned int get_default_threads() {
 }
 
 void print_help() {
-    std::cout << "Hypermash (v" << HYPERMASH_VERSION << "): Complete Edition\n\n"
+    std::cout << "Hypermash (v" << HYPERMASH_VERSION << ")\n\n"
               << "Usage: hypermash <command> [options] <input_file>\n\n"
               << "Commands:\n"
               << "  sketch      Create a compact sketch from a single FASTA file.\n"
@@ -844,7 +844,7 @@ void handle_sketch(const std::vector<std::string>& args) {
         i++;
     }
 
-    if (k > 32) throw std::invalid_argument("Version 15.0 uses 64-bit hardware encoding. Max k-mer size is 32.");
+    if (k > 32) throw std::invalid_argument("This version uses 64-bit hardware encoding. Max k-mer size is 32.");
     if (D % 8 != 0) throw std::runtime_error("Dimensions (-d) must be a multiple of 8.");
     if (input_file.empty()) throw std::runtime_error("No input FASTA file provided.");
     if (num_threads == 0) throw std::runtime_error("Thread count must be at least 1.");
