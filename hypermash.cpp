@@ -1,9 +1,14 @@
 /**
- * HYPERMASH: Hyperdimensional Genomic Sketching
- * * Description: 
+ * HYPERMASH
+ * 
  * Hypermash uses Hyperdimensional Computing (HDC) to encode the topology of De Bruijn 
  * sequence graphs into binarized hypervectors. Unlike "bag-of-words" MinHash approaches, 
  * Hypermash preserves structural variation data (edges between adjacent k-mers).
+ * * This codebase is aggressively optimized for bare-metal performance, utilizing 
+ * Data-Oriented Design (SoA), SWAR hashing, OS-level Zero-Copy memory mapping, 
+ * L1-Cache locking, AVX2 vectorization, and Statistical Adaptive Error Mitigation.
+ * 
+ * g++ -O3 -std=c++17 -pthread -march=native hypermash.cpp -o hypermash
  */
 
 // Explicit hardware vectorization pragmas to force the compiler to utilize 256-bit registers.
@@ -59,18 +64,15 @@ const std::string HYPERMASH_VERSION = "1.0";
 static int BIT_TO_INT_LUT[256][8];
 static bool lut_initialized = false;
 
-//==============================================================================
-// Type Definitions
-//==============================================================================
 // A Memory Bank is a flattened 1D array representing an M x D matrix of integers.
 using MemoryBank = std::vector<int>;
 
 // Compact memory structure for comparing sketches. 
 // Uses 64-bit integers to tightly pack binary hypervectors (1 bit per dimension).
 struct PackedSketch {
-    size_t M;               // Number of memory buckets
-    int D;                  // Hypervector dimensions (e.g., 10,000)
-    int num_blocks;         // Number of 64-bit integers needed to store D bits
+    size_t M;                    // Number of memory buckets
+    int D;                       // Hypervector dimensions (e.g., 10,000)
+    int num_blocks;              // Number of 64-bit integers needed to store D bits
     std::vector<uint64_t> bits;  // The flattened 1D array of bit-packed vectors
     std::vector<uint8_t> empty;  // Fast sentinel array: 1 if bucket is entirely empty
 };
@@ -83,7 +85,7 @@ struct PackedSketch {
  * deterministic_hash_kmer: Hashes a 2-bit integer-encoded k-mer.
  * Uses a SIMD Within A Register (SWAR) technique to extract ASCII characters 
  * directly from a 64-bit magic constant ("TGCA") without doing slow array lookups.
- * Perfectly replicates the standard FNV-1a string hash behavior.
+ * Perfectly replicates standard FNV-1a string hash behavior at hardware speeds.
  */
 static inline uint64_t deterministic_hash_kmer(uint64_t kmer_bits, int k) {
     uint64_t hash = 14695981039346656037ULL;
@@ -98,19 +100,6 @@ static inline uint64_t deterministic_hash_kmer(uint64_t kmer_bits, int k) {
         hash *= 1099511628211ULL; // FNV-1a prime
     }
     return hash;
-}
-
-/**
- * get_block_bits: A stateless SplitMix64 pseudo-random number generator (PRNG).
- * By passing the dimension block index, we can instantly jump to any block of 
- * 64 dimensions without generating previous numbers in a loop.
- */
-static inline uint64_t get_block_bits(uint64_t seed, int block_idx) {
-    // Weyl Sequence: Addition prevents dimensions from clumping together mathematically.
-    uint64_t z = seed + (static_cast<uint64_t>(block_idx) * 0x9e3779b97f4a7c15ULL);
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-    return z ^ (z >> 31);
 }
 
 //==============================================================================
@@ -141,9 +130,9 @@ public:
     /**
      * encode_single: The core sketching engine.
      * Takes a pre-tokenized genome and converts it into an HDC Memory Bank using 
-     * a 4-Phase hyper-optimized Map-Reduce architecture.
+     * a 5-Phase hyper-optimized architecture.
      */
-    MemoryBank encode_single(const std::vector<uint8_t>& tokenized_genome, unsigned int num_threads) {
+    MemoryBank encode_single(const std::vector<uint8_t>& tokenized_genome, unsigned int num_threads, int max_iterations) {
         if (tokenized_genome.size() <= static_cast<size_t>(k)) return MemoryBank(M * D, 0);
 
         size_t chunk_size = (tokenized_genome.size() + num_threads - 1) / num_threads;
@@ -194,7 +183,7 @@ public:
                     uint8_t base = tokenized_genome[j];
                     
                     // Value > 3 indicates an 'N' or ambiguous base. Instantly resets the sequence 
-                    // to break the graph at scaffold boundaries, preventing false structural variations.
+                    // to break the graph at scaffold boundaries, preventing false structural connections.
                     if (base > 3) { valid_bases = 0; continue; }
 
                     // Rolling 2-bit hash computation
@@ -271,15 +260,10 @@ public:
         size_t buckets_per_thread = (M + num_threads - 1) / num_threads;
 
         for (unsigned int t = 0; t < num_threads; ++t) {
-            threads.emplace_back([&, t, buckets_per_thread, &sorted_targets, &global_offsets]() {
+            threads.emplace_back([&, t, buckets_per_thread, &sorted_targets, &global_offsets, &final_bank]() {
                 size_t start_m = t * buckets_per_thread;
                 size_t end_m = std::min(start_m + buckets_per_thread, M);
-                if (start_m >= M) return;
-
-                int full_blocks = D / 64;
-                int max_leftover = D % 64;
-                const uint64_t WEYL_MAGIC = 0x9e3779b97f4a7c15ULL;
-
+                
                 // Process generation Bucket by Bucket.
                 for (size_t m = start_m; m < end_m; ++m) {
                     size_t edge_start = global_offsets[m];
@@ -287,60 +271,146 @@ public:
                     if (edge_start == edge_end) continue; 
 
                     int* row = &final_bank[m * D];
-
+                    
                     // Because all edges targeting this bucket are contiguous in memory (thanks to Phase 3),
                     // the CPU locks `row` into the L1 cache. We process thousands of edges instantly 
                     // without experiencing Cache Thrashing or requesting Main RAM.
                     for (size_t e = edge_start; e < edge_end; ++e) {
-                        uint64_t current_z = sorted_targets[e];
-
-                        for (int b = 0; b < full_blocks; ++b) {
-                            // Fast inline SplitMix64 step
-                            uint64_t z = current_z;
-                            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-                            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-                            uint64_t r = z ^ (z >> 31);
-                            
-                            // WEYL Sequence: Simple addition avoids multiplication cycles
-                            current_z += WEYL_MAGIC; 
-
-                            int* target_row = &row[b * 64];
-                            uint8_t* r_bytes = reinterpret_cast<uint8_t*>(&r);
-                            
-                            // The L1 LUT Vectorization Trick
-                            // Compiles down to AVX2 VPADDD instructions, doing 8 dimensions simultaneously.
-                            #pragma GCC unroll 8
-                            for (int i = 0; i < 8; ++i) {
-                                const int* lut = BIT_TO_INT_LUT[r_bytes[i]];
-                                #pragma GCC unroll 8
-                                for(int j = 0; j < 8; ++j) target_row[i * 8 + j] += lut[j];
-                            }
-                        }
-                        
-                        // Handle remaining dimensions if D is not a perfect multiple of 64
-                        if (max_leftover > 0) {
-                            uint64_t z = current_z;
-                            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-                            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-                            uint64_t r = z ^ (z >> 31);
-                            
-                            int* target_row = &row[full_blocks * 64];
-                            uint8_t* r_bytes = reinterpret_cast<uint8_t*>(&r);
-                            
-                            for (int i = 0; i < max_leftover / 8; ++i) {
-                                const int* lut = BIT_TO_INT_LUT[r_bytes[i]];
-                                #pragma GCC unroll 8
-                                for(int j = 0; j < 8; ++j) target_row[i * 8 + j] += lut[j];
-                            }
-                            for (int i = (max_leftover / 8) * 8; i < max_leftover; ++i) {
-                                target_row[i] += (((r >> i) & 1) << 1) - 1;
-                            }
-                        }
+                        add_target_vector(row, sorted_targets[e]);
                     }
                 }
             });
         }
         for (auto& t : threads) t.join();
+
+        // ==============================================================================
+        // PHASE 5: Adaptive Error Mitigation (Retraining)
+        // ==============================================================================
+        // Only runs if -r flag is passed. Reuses the sorted_targets array for lightning-fast evaluations.
+        if (max_iterations > 0) {
+            std::cout << "\n[Retraining] Initializing Adaptive Error Mitigation...\n";
+            size_t total_edges = current_pos;
+            double sqrt_D = std::sqrt(static_cast<double>(D));
+
+            // Helper Lambda: Computes overall fidelity (1.0 - Error Rate) of the current bank
+            auto compute_fidelity = [&]() {
+                std::atomic<double> total_norm_sim{0.0};
+                std::vector<std::thread> eval_threads;
+                for(unsigned int t = 0; t < num_threads; ++t) {
+                    eval_threads.emplace_back([&, t]() {
+                        size_t start_m = t * buckets_per_thread;
+                        size_t end_m = std::min(start_m + buckets_per_thread, M);
+                        double local_sim = 0.0;
+                        
+                        for(size_t m = start_m; m < end_m; ++m) {
+                            size_t edge_start = global_offsets[m];
+                            size_t edge_end = global_offsets[m+1];
+                            if(edge_start == edge_end) continue;
+
+                            double mag_sq = 0;
+                            int* row = &final_bank[m * D];
+                            for(int d=0; d<D; ++d) mag_sq += row[d]*row[d];
+                            double mag = std::sqrt(mag_sq);
+
+                            if(mag > 0.0) {
+                                double denominator = mag * sqrt_D;
+                                for(size_t e = edge_start; e < edge_end; ++e) {
+                                    double sim = compute_target_sim(row, sorted_targets[e], denominator);
+                                    local_sim += (sim + 1.0) / 2.0; // Normalize [-1, 1] to [0, 1]
+                                }
+                            } else {
+                                local_sim += 0.5 * (edge_end - edge_start);
+                            }
+                        }
+                        double cur = total_norm_sim.load(std::memory_order_relaxed);
+                        while(!total_norm_sim.compare_exchange_weak(cur, cur + local_sim, std::memory_order_relaxed));
+                    });
+                }
+                for(auto& th: eval_threads) th.join();
+                return total_edges > 0 ? (total_norm_sim.load() / total_edges) : 1.0;
+            };
+
+            double fidelity = compute_fidelity();
+            double best_error = 1.0 - fidelity;
+            std::cout << "  - Initial Error Rate: " << std::fixed << std::setprecision(6) << best_error << "\n";
+
+            // Iterative Gradient-Descent style error correction
+            for(int iter = 0; iter < max_iterations; ++iter) {
+                // BACKUP: Save the best known state before modifying it to guarantee stability
+                MemoryBank previous_bank = final_bank;
+
+                std::vector<std::thread> ref_threads;
+                for(unsigned int t = 0; t < num_threads; ++t) {
+                    ref_threads.emplace_back([&, t]() {
+                        size_t start_m = t * buckets_per_thread;
+                        size_t end_m = std::min(start_m + buckets_per_thread, M);
+                        
+                        // THREAD-LOCAL CACHE: Prevents dynamic memory allocation inside the fast loop
+                        std::vector<double> local_sims;
+                        local_sims.reserve(1024);
+
+                        for(size_t m = start_m; m < end_m; ++m) {
+                            size_t edge_start = global_offsets[m];
+                            size_t edge_end = global_offsets[m+1];
+                            size_t num_edges = edge_end - edge_start;
+                            if(num_edges == 0) continue;
+
+                            double mag_sq = 0;
+                            int* row = &final_bank[m * D];
+                            for(int d=0; d<D; ++d) mag_sq += row[d]*row[d];
+                            double mag = std::sqrt(mag_sq);
+                            double denominator = mag * sqrt_D;
+                            
+                            // PASS 1: Calculate similarities and aggregate statistical moments
+                            local_sims.resize(num_edges);
+                            double sum_sim = 0.0;
+                            double sum_sim_sq = 0.0;
+
+                            for(size_t e = 0; e < num_edges; ++e) {
+                                uint64_t thash = sorted_targets[edge_start + e];
+                                double sim = mag > 0.0 ? compute_target_sim(row, thash, denominator) : 0.0;
+                                local_sims[e] = sim;
+                                sum_sim += sim;
+                                sum_sim_sq += sim * sim;
+                            }
+
+                            // Calculate Data-Driven Local Threshold (Mean - 1 Standard Deviation)
+                            // This purely statistical approach dynamically prevents runaway signal oscillation.
+                            double threshold = -1.0; // Default: Do not retrain (e.g., if only 1 edge exists)
+                            if (num_edges > 1) {
+                                double mean = sum_sim / num_edges;
+                                double variance = (sum_sim_sq / num_edges) - (mean * mean);
+                                if (variance < 0.0) variance = 0.0; // Guard against floating-point precision drifts
+                                double stddev = std::sqrt(variance);
+                                threshold = mean - stddev;
+                            }
+
+                            // PASS 2: Reinforce edges that fall below the statistical standard deviation
+                            for(size_t e = 0; e < num_edges; ++e) {
+                                if(local_sims[e] < threshold) {
+                                    add_target_vector(row, sorted_targets[edge_start + e]);
+                                }
+                            }
+                        }
+                    });
+                }
+                for(auto& th: ref_threads) th.join();
+
+                double new_fid = compute_fidelity();
+                double new_error = 1.0 - new_fid;
+                std::cout << "  - Iteration " << (iter + 1) << ": Error Rate " << std::fixed << std::setprecision(6) << new_error;
+                
+                if(new_error >= best_error) {
+                    std::cout << " -> No improvement. Rolling back and stopping early.\n";
+                    // ROLLBACK: Instantly restore the previous best state via 0-cost pointer swap
+                    final_bank = std::move(previous_bank);
+                    break;
+                } else {
+                    std::cout << " -> Improved.\n";
+                    best_error = new_error;
+                }
+            }
+        }
 
         return final_bank;
     }
@@ -401,6 +471,105 @@ private:
     int k, D;
     size_t M;
     uint64_t kmer_mask;
+
+    /**
+     * add_target_vector:
+     * Helper that dynamically generates a high-dimensional vector and ADDS it to the Memory Bank.
+     * Replaces standard PRNG multiplication with a fast rolling Weyl Sequence addition.
+     * Uses the 8KB global LUT to unroll 8 dimensions at a time into AVX2 instructions.
+     */
+    inline void add_target_vector(int* target_row_base, uint64_t target_hash) const {
+        int full_blocks = D / 64;
+        int max_leftover = D % 64;
+        const uint64_t WEYL_MAGIC = 0x9e3779b97f4a7c15ULL;
+        uint64_t current_z = target_hash;
+
+        for (int b = 0; b < full_blocks; ++b) {
+            uint64_t z = current_z;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            uint64_t r = z ^ (z >> 31);
+            current_z += WEYL_MAGIC; 
+
+            int* target_row = &target_row_base[b * 64];
+            uint8_t* r_bytes = reinterpret_cast<uint8_t*>(&r);
+            
+            #pragma GCC unroll 8
+            for (int i = 0; i < 8; ++i) {
+                const int* lut = BIT_TO_INT_LUT[r_bytes[i]];
+                #pragma GCC unroll 8
+                for(int j = 0; j < 8; ++j) target_row[i * 8 + j] += lut[j];
+            }
+        }
+        if (max_leftover > 0) {
+            uint64_t z = current_z;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            uint64_t r = z ^ (z >> 31);
+            
+            int* target_row = &target_row_base[full_blocks * 64];
+            uint8_t* r_bytes = reinterpret_cast<uint8_t*>(&r);
+            
+            for (int i = 0; i < max_leftover / 8; ++i) {
+                const int* lut = BIT_TO_INT_LUT[r_bytes[i]];
+                #pragma GCC unroll 8
+                for(int j = 0; j < 8; ++j) target_row[i * 8 + j] += lut[j];
+            }
+            for (int i = (max_leftover / 8) * 8; i < max_leftover; ++i) {
+                target_row[i] += (((r >> i) & 1) << 1) - 1;
+            }
+        }
+    }
+
+    /**
+     * compute_target_sim:
+     * Helper that calculates the exact dot-product Cosine Similarity of a generated vector
+     * against its corresponding Memory Bank row without needing to materialize the vector in RAM.
+     */
+    inline double compute_target_sim(const int* target_row_base, uint64_t target_hash, double denominator) const {
+        double dot = 0.0;
+        int full_blocks = D / 64;
+        int max_leftover = D % 64;
+        const uint64_t WEYL_MAGIC = 0x9e3779b97f4a7c15ULL;
+        uint64_t current_z = target_hash;
+
+        for (int b = 0; b < full_blocks; ++b) {
+            uint64_t z = current_z;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            uint64_t r = z ^ (z >> 31);
+            current_z += WEYL_MAGIC; 
+
+            const int* target_row = &target_row_base[b * 64];
+            uint8_t* r_bytes = reinterpret_cast<uint8_t*>(&r);
+            
+            #pragma GCC unroll 8
+            for (int i = 0; i < 8; ++i) {
+                const int* lut = BIT_TO_INT_LUT[r_bytes[i]];
+                #pragma GCC unroll 8
+                for(int j = 0; j < 8; ++j) dot += target_row[i * 8 + j] * lut[j];
+            }
+        }
+        if (max_leftover > 0) {
+            uint64_t z = current_z;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            uint64_t r = z ^ (z >> 31);
+            
+            const int* target_row = &target_row_base[full_blocks * 64];
+            uint8_t* r_bytes = reinterpret_cast<uint8_t*>(&r);
+            
+            for (int i = 0; i < max_leftover / 8; ++i) {
+                const int* lut = BIT_TO_INT_LUT[r_bytes[i]];
+                #pragma GCC unroll 8
+                for(int j = 0; j < 8; ++j) dot += target_row[i * 8 + j] * lut[j];
+            }
+            for (int i = (max_leftover / 8) * 8; i < max_leftover; ++i) {
+                dot += target_row[i] * ((((r >> i) & 1) << 1) - 1);
+            }
+        }
+        return dot / denominator;
+    }
 };
 
 //==============================================================================
@@ -634,7 +803,7 @@ unsigned int get_default_threads() {
 }
 
 void print_help() {
-    std::cout << "Hypermash (v" << HYPERMASH_VERSION << "): Singularity Edition\n\n"
+    std::cout << "Hypermash (v" << HYPERMASH_VERSION << "): Complete Edition\n\n"
               << "Usage: hypermash <command> [options] <input_file>\n\n"
               << "Commands:\n"
               << "  sketch      Create a compact sketch from a single FASTA file.\n"
@@ -647,6 +816,7 @@ void print_help() {
               << "  -d <int>    Hypervector dimensions (must be multiple of 8, default: 10000)\n"
               << "  -m <int>    Memory bank size (default: 4096)\n"
               << "  -t <int>    Number of threads (default: all available cores)\n"
+              << "  -r <int>    Retraining iterations for error mitigation (default: 0)\n"
               << "  -o <file>   Output file prefix (for sketch command)\n"
               << "  -l <file>   File containing a list of sketch paths, one per line (for dist command)\n";
 }
@@ -657,6 +827,7 @@ void handle_sketch(const std::vector<std::string>& args) {
     int k = 9, D = 10000;
     size_t M = 4096;
     unsigned int num_threads = get_default_threads();
+    int iterations = 0;
 
     size_t i = 2;
     while (i < args.size()) {
@@ -664,6 +835,7 @@ void handle_sketch(const std::vector<std::string>& args) {
         else if (args[i] == "-d" && i + 1 < args.size()) { D = std::stoi(args[++i]); }
         else if (args[i] == "-m" && i + 1 < args.size()) { M = std::stoul(args[++i]); }
         else if (args[i] == "-t" && i + 1 < args.size()) { num_threads = std::stoi(args[++i]); }
+        else if (args[i] == "-r" && i + 1 < args.size()) { iterations = std::stoi(args[++i]); }
         else if (args[i] == "-o" && i + 1 < args.size()) { output_file = args[++i] + ".hms"; }
         else if (args[i][0] != '-') { 
             if (!input_file.empty()) throw std::runtime_error("Only one input FASTA file is allowed.");
@@ -672,7 +844,7 @@ void handle_sketch(const std::vector<std::string>& args) {
         i++;
     }
 
-    if (k > 32) throw std::invalid_argument("This version uses 64-bit hardware encoding. Max k-mer size is 32.");
+    if (k > 32) throw std::invalid_argument("Version 15.0 uses 64-bit hardware encoding. Max k-mer size is 32.");
     if (D % 8 != 0) throw std::runtime_error("Dimensions (-d) must be a multiple of 8.");
     if (input_file.empty()) throw std::runtime_error("No input FASTA file provided.");
     if (num_threads == 0) throw std::runtime_error("Thread count must be at least 1.");
@@ -688,7 +860,7 @@ void handle_sketch(const std::vector<std::string>& args) {
     std::cout << "Processing " << input_file << "..." << std::endl;
     
     std::vector<uint8_t> tokenized_genome = load_and_tokenize_fasta(input_file);
-    MemoryBank bank = encoder.encode_single(tokenized_genome, num_threads);
+    MemoryBank bank = encoder.encode_single(tokenized_genome, num_threads, iterations);
 
     HypermashHeader header;
     strncpy(header.version, HYPERMASH_VERSION.c_str(), 15); header.version[15] = '\0';
@@ -720,7 +892,6 @@ void handle_dist(const std::vector<std::string>& args) {
         if (!infile) throw std::runtime_error("Could not open list file: " + list_file);
         std::string line;
         while (std::getline(infile, line)) {
-            // Trim whitespace and newlines from both ends
             line.erase(line.find_last_not_of(" \n\r\t") + 1);
             size_t start = line.find_first_not_of(" \n\r\t");
             if (start != std::string::npos) {
