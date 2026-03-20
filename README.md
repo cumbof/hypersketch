@@ -1,80 +1,116 @@
 # hypermash
-Graph-based Genome Sketching via Hyperdimensional Computing
+
+Graph-Based Genome Sketching via Hyperdimensional Computing
 
 ## Overview
 
-Hypermash is a bioinformatics tool designed to compute the similarity between genomes. Unlike traditional methods (like Mash) that compare the set of k-mers (a "bag of words" approach), Hypermash sketches the _de Bruijn_ Graph structure of the genome.
+Hypermash is a high-performance bioinformatics engine designed to compute evolutionary distances between genomes.
 
-It encodes the transitions between k-mers (syntax/structure) rather than just their presence. It utilizes Hyperdimensional Computing (HDC) to compress this vast graph structure into a fixed-size, low-memory vector representation called a Memory Bank.
+Unlike traditional MinHash approaches that compare unstructured sets of k-mers (a "bag-of-words"), Hypermash sketches the topological structure of the _de Bruijn_ sequence graph. By encoding the transitions (edges) between adjacent k-mers, Hypermash captures genomic syntax and structural variation. It utilizes Hyperdimensional Computing (HDC) to compress this vast graphical topology into a fixed-size, heavily binarized matrix representation called a Memory Bank.
+
+The underlying C++ engine is aggressively optimized for bare-metal hardware performance, utilizing Zero-Copy OS Memory Mapping, Data-Oriented Design (SoA), SIMD AVX2 vectorization, L1-cache locking, and Statistical Adaptive Error Mitigation.
 
 ## Core Data Structures
 
 ### The Hypervector
 
-A vector of dimensions _D_ (default 10,000), where every element is randomly initialized to either +1 or -1. Any two randomly generated hypervectors are pseudo-orthogonal, meaning their cosine similarity is approximately 0.
+A high-dimensional vector (default $D = 10,000$), where every element is deterministically generated as $+1$ or $-1$ using a Weyl-sequence PRNG. In high-dimensional space, any two randomly generated hypervectors are pseudo-orthogonal (their cosine similarity approaches 0).
 
 ### The Memory Bank
 
-A matrix of size _M x D_. It acts as a hash table where the "keys" are k-mers and the "values" are the sum (superposition) of all k-mers that follow the key. Because _M_ (default 4096) is potentially much smaller than the total number of unique k-mers in a genome, multiple k-mers map to the same row (hash collisions). Hyperdimensional Computing math allows us to tolerate this noise up to a point.
+A densely packed matrix of size $M \times D$ (default $M = 4096$). It functions as a graphical hash table where:
 
-### The Sketching Algorithm
+- __Keys:__ The source k-mer.
 
-The sketching process transforms a linear DNA sequence into a Memory Bank.
+- __Values:__ The bundled superposition (element-wise addition) of all target k-mers that follow the source in the genome.
 
-1. Input Processing
-  - Reading: the genome is read from a FASTA file;
-  - Canonical k-mers: for every window of size _k_, the tool computes the canonical k-mer. This is the lexicographically smaller sequence between the k-mer and its reverse complement. This ensures that a sequence and its reverse complement map to the same graph structure.
+Because $M$ is significantly smaller than the total k-mer vocabulary of a genome, collisions occur. The mathematics of Hyperdimensional Computing allow the system to tolerate this overlapping noise while preserving the dominant topological signals.
 
-2. Graph Encoding (the `source > target` logic)
-  - Window: `source` (k-mer at _i_) > `target` (k-mer at _i+1_);
-  - Hashing: the `source` k-mer is hashed to an index _idx_ (0..._M_-1);
-  - Generation: a deterministic unique Hypervector is generated for the `target` k-mer (_HV-target_);
-  - Bundling: _HV-target_ is added (element-wise addition) to the row at `MemoryBank[idx]`;
-  - Result: row _i_ in the bank becomes a superposition of all k-mers that ever followed any source k-mer that hashed to index _i_.
+## The Sketching Algorithm
 
-3. Parallelization (Map-Reduce Pattern)
-  - To maximize speed, the encoding uses a lock-free Map-Reduce approach;
-  - Map Phase: the genome is split into _N_ chunks (where _N_ is the thread count). Each thread creates its own private Memory Bank and sketches its chunk;
-  - Reduce Phase: once all threads finish, a parallel reduction merges the _N_ private banks into one final global Memory Bank by summing them element-wise.
+The encoding pipeline transforms a FASTA sequence into a Memory Bank using a 5-phase, lock-free, cache-optimized architecture:
 
-### Error Mitigation and Fidelity
+### 1. Zero-Copy I/O & Tokenization
 
-Because the Memory Bank is "lossy" (due to hash collisions), the tool includes mechanisms to measure and repair signal loss.
+The genome is never loaded as a standard string. Using OS-level mmap, the physical SSD blocks are mapped directly into the CPU's virtual memory. A pointer-bumping parser tokenizes ASCII characters into 0-3 integers on the fly. Ambiguous bases (e.g., N) are flagged to instantly sever structural edges, preventing false connections across scaffold boundaries.
 
-1. Fidelity Calculation
-  - This measures how well the sketch "remembers" the genome;
-  - The tool re-scans the genome edges (`source > target`);
-  - It compares the similarity between the Source bucket in the bank and the true Target hypervector;
-  - Fidelity Score: The average normalized similarity across all edges (0.0 to 1.0);
-  - Error Rate: 1.0 - Fidelity.
+### 2. Edge Extraction & SWAR Hashing
 
-2. Adaptive Retraining
-  - If enabled, the tool attempts to "boost" weak signals (Gradient Descent-style logic);
-  - Dynamic Thresholding: the tool calculates a specific threshold for every bucket in the memory bank;
-    - As a bucket accumulates vectors, its magnitude grows, and expected similarity drops;
-    - Formula: `Threshold_i = (sqrt(D) / |Magnitude_i|) x 0.75`;
-  - Detection: if an edge's similarity is below this dynamic threshold, it is flagged as a "weak link";
-  - Correction: the target vector is added again to the source bucket. This increases the signal-to-noise ratio for that specific transition;
-  - Early Stopping: after each iteration, the Error Rate is recalculated. If the error rate does not improve (or gets worse), the loop breaks immediately.
+The genome is chunked across available CPU threads. For every valid edge (source $\rightarrow$ target), the algorithm:
 
-### Comparison Algorithm
+- Computes the canonical orientation to ensure strandedness independence.
 
-To compare two genomes (Sketch A and Sketch B), the tool compares their Memory Banks row-by row.
+- Uses SWAR (SIMD Within A Register) to hash the k-mers without slow array lookups.
 
-1. Requirement: sketches must share the same _k_, _D_, and _M_ parameters;
-2. Row Comparison: for every row _i_:
-  - Compute cosine similarity between `BankA[i]` and `BankB[i]`;
-3. Aggregation: the final similarity is the average of all row similarities.
+- Extracts the target hash and its destination bucket.
 
-Interpretation:
-- __1.0__: the graph structures are identical;
-- __0.0__: the graph structures are completely disjoint.
+### 3. Data-Oriented Counting Sort (Scatter)
 
-### Implementation Specs
+To prevent RAM cache thrashing, Hypermash utilizes Data-Oriented Design (Structure of Arrays). Thread-local edges are mapped using flattened Prefix Sums. An $O(N)$ parallel Counting Sort groups all edges destined for the same memory bucket into perfectly contiguous memory blocks.
 
-- Language: C++17
-- Threading: uses `std::thread`, `std::vector` for thread management, and `std::atomic` for thread-safe counters in the reduction phase;
-- Storage: the final file is heavily compressed using Bit-Packing:
-  - Since Hypervectors are sums of +1 and -1, final values are integers;
-  - The file stores the sign bit of these integers packed into bytes (_D_ dimensions, _D_/8 bytes per row);
-  - This achieves a 32x compression ratio compared to storing raw 32-bit integers.
+### 4. L1-Cache Locked Vector Generation
+
+With all edges perfectly grouped by bucket, threads pull a single row of the Memory Bank into the CPU's 40KB L1 Cache.
+Instead of doing sequential bit-math, an 8KB Global Lookup Table (LUT) translates 64-bit random seeds into $+1/-1$ arrays instantly. The compiler fuses these lookups into AVX2 VPADDD vector instructions, generating and bundling 8 dimensions simultaneously per clock cycle before writing the finalized row back to main memory.
+
+### 5. Statistical Adaptive Error Mitigation (Retraining)
+
+To mitigate hash-collision interference without inflating the Memory Bank size, Hypermash employs a dynamic, data-driven error mitigation algorithm.
+
+- For each memory bucket, the engine calculates the true Mean ($\mu$) and Standard Deviation ($\sigma$) of the constituent edge similarities.
+
+- Any topological edge whose similarity degrades more than one standard deviation below the local bucket's mean ($< \mu - 1\sigma$) is identified as structurally compromised and algorithmically reinforced.
+
+- This purely statistical approach dynamically prevents runaway signal oscillation. An instant 0-cost rollback mechanism guarantees that the engine stops early if the overall error rate fails to improve, ensuring perfect model stability.
+
+## Comparison Algorithm & Distance Estimation
+
+To compare two genomes, Hypermash executes a parallel, lock-free matrix boarding process:
+
+1. __Hardware POPCOUNT:__ Because the final sketches are bit-packed, the comparison uses hardware-level __builtin_popcountll and bitwise XOR gates to compute the Hamming distance between aligned memory buckets at blazing speeds.
+
+2. __Algebraic Translation:__ Hamming distance is algebraically converted to Binarized Cosine Similarity: Sim = 1 - (2 * Hamming) / D.
+
+3. __Grothendieck's Identity:__ The binarized similarity is mathematically un-distorted using Grothendieck's identity to approximate the Jaccard Index: Jaccard = sin(Sim * PI / 2).
+
+4. __Mash Distance:__ Finally, the standard MinHash mutation probability formula is applied to estimate the true evolutionary distance: d = (-1 / k) * ln(Jaccard).
+
+## Usage
+
+```text
+Hypermash (v1.0)
+
+Usage: hypermash <command> [options] <input_file>
+
+Commands:
+  sketch      Create a compact sketch from a single FASTA file.
+  dist        Calculate similarity between two sketch files.
+  info        Display metadata and information about a sketch file.
+  version     Print the software version.
+  help        Show this help message.
+
+Options:
+  -k <int>    K-mer size (max 32, default: 9)
+  -d <int>    Hypervector dimensions (must be multiple of 8, default: 10000)
+  -m <int>    Memory bank size (default: 4096)
+  -t <int>    Number of threads (default: all available cores)
+  -r <int>    Retraining iterations for error mitigation (default: 0)
+  -o <file>   Output file prefix (for sketch command)
+  -l <file>   File containing a list of sketch paths, one per line (for dist command)
+```
+
+## Implementation Specs
+
+- __Language:__ C++17
+
+- __Compiler Requirements:__ Requires modern GCC/Clang with -march=native to unlock hardware-specific AVX2, BMI2, and POPCNT instructions.
+
+- __I/O:__ Fully asynchronous batch processing via Matrix Job Generation (bypasses ARG_MAX terminal limits using the -l list flag).
+
+- __Storage:__ Final .hms files are aggressively bit-packed (8 dimensions per byte) using 8-way unrolled OR-gates, achieving a 32x compression ratio over raw integers.
+
+## Credits
+
+If you use Hypermash in your work, please cite:
+
+> _Manuscript in preparation_
