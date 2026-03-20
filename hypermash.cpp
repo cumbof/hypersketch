@@ -260,7 +260,7 @@ public:
         size_t buckets_per_thread = (M + num_threads - 1) / num_threads;
 
         for (unsigned int t = 0; t < num_threads; ++t) {
-            threads.emplace_back([&, t, buckets_per_thread, &sorted_targets, &global_offsets, &final_bank]() {
+            threads.emplace_back([&, t, buckets_per_thread]() {
                 size_t start_m = t * buckets_per_thread;
                 size_t end_m = std::min(start_m + buckets_per_thread, M);
                 
