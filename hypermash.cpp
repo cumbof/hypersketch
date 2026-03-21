@@ -288,29 +288,30 @@ public:
                     size_t edge_end = global_offsets[m+1];
                     if (edge_start == edge_end) continue; 
 
-                    int* row = &final_bank[m * D];
+                    // --- SET THEORY FIX ---
+                    std::sort(&sorted_targets[edge_start], &sorted_targets[edge_end]);
 
-                    // Because all edges targeting this bucket are contiguous in memory (thanks to Phase 3),
-                    // the CPU locks `row` into the L1 cache. We process thousands of edges instantly 
-                    // without experiencing Cache Thrashing or requesting Main RAM.
+                    int* row = &final_bank[m * D];
+                    uint64_t last_target = 0;
+
                     for (size_t e = edge_start; e < edge_end; ++e) {
                         uint64_t current_z = sorted_targets[e];
+                        
+                        // Ignore duplicate edges to enforce Set Theory (aligns with Mash)
+                        if (e > edge_start && current_z == last_target) continue;
+                        last_target = current_z;
 
                         for (int b = 0; b < full_blocks; ++b) {
-                            // Fast inline SplitMix64 step
                             uint64_t z = current_z;
                             z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
                             z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
                             uint64_t r = z ^ (z >> 31);
                             
-                            // WEYL Sequence: Simple addition avoids multiplication cycles
                             current_z += WEYL_MAGIC; 
 
                             int* target_row = &row[b * 64];
                             uint8_t* r_bytes = reinterpret_cast<uint8_t*>(&r);
                             
-                            // The L1 LUT Vectorization Trick
-                            // Compiles down to AVX2 VPADDD instructions, doing 8 dimensions simultaneously.
                             #pragma GCC unroll 8
                             for (int i = 0; i < 8; ++i) {
                                 const int* lut = BIT_TO_INT_LUT[r_bytes[i]];
@@ -319,7 +320,6 @@ public:
                             }
                         }
                         
-                        // Handle remaining dimensions if D is not a perfect multiple of 64
                         if (max_leftover > 0) {
                             uint64_t z = current_z;
                             z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
@@ -349,26 +349,28 @@ public:
 
     /**
      * fast_compare_packed_single: 
-     * Computes the mathematical Cosine Similarity between two binarized sketches.
-     * Uses bitwise XOR and Hardware POPCOUNT to reduce floating-point operations 
-     * to a single algebraic fraction: Sim = 1 - (2 * Hamming) / Dimensions.
+     * Computes the mathematical Binarized Cosine Similarity.
      */
     static double fast_compare_packed_single(const PackedSketch& s1, const PackedSketch& s2) {
         if (s1.M != s2.M || s1.D != s2.D || s1.M == 0) return 0.0;
 
         uint64_t local_hamming = 0;
+        uint32_t active_A = 0;
+        uint32_t active_B = 0;
         uint32_t local_active = 0;
-        uint32_t local_single = 0;
 
         int blocks = s1.num_blocks;
         const uint64_t* bits1 = s1.bits.data();
         const uint64_t* bits2 = s2.bits.data();
 
         for (size_t i = 0; i < s1.M; ++i) {
-            // Ignore buckets that are empty in both sketches (prevents baseline inflation)
-            if (s1.empty[i] && s2.empty[i]) continue;
+            bool a_active = !s1.empty[i];
+            bool b_active = !s2.empty[i];
             
-            if (!s1.empty[i] && !s2.empty[i]) {
+            if (a_active) active_A++;
+            if (b_active) active_B++;
+
+            if (a_active && b_active) {
                 local_active++;
                 const uint64_t* row1 = &bits1[i * blocks];
                 const uint64_t* row2 = &bits2[i * blocks];
@@ -384,19 +386,19 @@ public:
                 for (; b < blocks; ++b) {
                     local_hamming += POPCOUNT64(row1[b] ^ row2[b]);
                 }
-            } else {
-                // If one bucket is empty and the other isn't, the similarity is mathematically 0.0.
-                // We tally it here to increment the denominator without adding to the similarity numerator.
-                local_single++; 
             }
         }
 
-        uint32_t total_active_slots = local_active + local_single;
-        if (total_active_slots == 0) return 1.0;
+        if (active_A == 0 || active_B == 0) return 0.0;
 
-        // Algebraic translation: Cosine Similarity of Binarized Vectors
-        double sum_similarity = (double)local_active - (2.0 * local_hamming) / s1.D;
-        return sum_similarity / total_active_slots;
+        // Raw HDC Dot Product Sum across all intersecting active buckets
+        double total_intersect_dims = (double)local_active * s1.D;
+        double raw_dot_sum = total_intersect_dims - 2.0 * (double)local_hamming;
+
+        // True Matrix Binarized Cosine Similarity
+        // Eliminates the Jaccard Union denominator and replaces it with Geometric Magnitude
+        double denominator = s1.D * std::sqrt(static_cast<double>(active_A) * active_B);
+        return raw_dot_sum / denominator;
     }
 
 private:
@@ -434,23 +436,55 @@ void save_sketch(const MemoryBank& bank, const std::string& filepath, const Hype
         std::fill(packed_vec.begin(), packed_vec.end(), 0);
         const int* row = &bank[i * header.D];
         
-        // 8-WAY UNROLLED BIT PACKING
-        // Bypasses extremely slow modulo math (`d % 8`) using standard binary OR gates.
-        for(int d = 0; d <= header.D - 8; d += 8) {
-            uint8_t byte = 0;
-            if (row[d] > 0)   byte |= 1;
-            if (row[d+1] > 0) byte |= 2;
-            if (row[d+2] > 0) byte |= 4;
-            if (row[d+3] > 0) byte |= 8;
-            if (row[d+4] > 0) byte |= 16;
-            if (row[d+5] > 0) byte |= 32;
-            if (row[d+6] > 0) byte |= 64;
-            if (row[d+7] > 0) byte |= 128;
-            packed_vec[d / 8] = byte;
+        // --- CRYPTOGRAPHIC TIE-BREAKER ---
+        // First, check if the bucket is empty. If it is not, generate a deterministic 
+        // 'row_hash' based exclusively on its non-zero contents.
+        bool is_empty = true;
+        uint64_t row_hash = 14695981039346656037ULL;
+        for (int d = 0; d < header.D; ++d) {
+            if (row[d] != 0) { 
+                is_empty = false; 
+                row_hash ^= (static_cast<uint64_t>(std::abs(row[d])) * 1099511628211ULL) + static_cast<uint64_t>(d);
+                row_hash = (row_hash ^ (row_hash >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            }
         }
-        // Tail cleanup for remaining dimensions
-        for(int d = (header.D / 8) * 8; d < header.D; ++d) {
-            if (row[d] > 0) packed_vec[d / 8] |= (1 << (d % 8));
+
+        // If the bucket is active, we use the row_hash to seed a SplitMix64 PRNG.
+        // This generates completely random bits to tie-break any sums of 0. 
+        // Crucially, because it is seeded by row_hash, genomes with identical edges get 
+        // identical tie-breakers, while genomes with different edges get uncorrelated noise.
+        if (!is_empty) {
+            uint64_t tie_breaker_bits = 0;
+            for(int d = 0; d <= header.D - 8; d += 8) {
+                // Generate a fresh 64-bit random block every 64 dimensions
+                if (d % 64 == 0) {
+                    uint64_t z = row_hash + (d / 64) * 0x9e3779b97f4a7c15ULL;
+                    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+                    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+                    tie_breaker_bits = z ^ (z >> 31);
+                }
+                uint8_t byte = 0;
+                if (row[d] > 0   || (row[d]   == 0 && ((tie_breaker_bits >> (d % 64)) & 1))) byte |= 1;
+                if (row[d+1] > 0 || (row[d+1] == 0 && ((tie_breaker_bits >> ((d+1) % 64)) & 1))) byte |= 2;
+                if (row[d+2] > 0 || (row[d+2] == 0 && ((tie_breaker_bits >> ((d+2) % 64)) & 1))) byte |= 4;
+                if (row[d+3] > 0 || (row[d+3] == 0 && ((tie_breaker_bits >> ((d+3) % 64)) & 1))) byte |= 8;
+                if (row[d+4] > 0 || (row[d+4] == 0 && ((tie_breaker_bits >> ((d+4) % 64)) & 1))) byte |= 16;
+                if (row[d+5] > 0 || (row[d+5] == 0 && ((tie_breaker_bits >> ((d+5) % 64)) & 1))) byte |= 32;
+                if (row[d+6] > 0 || (row[d+6] == 0 && ((tie_breaker_bits >> ((d+6) % 64)) & 1))) byte |= 64;
+                if (row[d+7] > 0 || (row[d+7] == 0 && ((tie_breaker_bits >> ((d+7) % 64)) & 1))) byte |= 128;
+                packed_vec[d / 8] = byte;
+            }
+            for(int d = (header.D / 8) * 8; d < header.D; ++d) {
+                if (d % 64 == 0) {
+                    uint64_t z = row_hash + (d / 64) * 0x9e3779b97f4a7c15ULL;
+                    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+                    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+                    tie_breaker_bits = z ^ (z >> 31);
+                }
+                if (row[d] > 0 || (row[d] == 0 && ((tie_breaker_bits >> (d % 64)) & 1))) {
+                    packed_vec[d / 8] |= (1 << (d % 8));
+                }
+            }
         }
         
         outfile.write(reinterpret_cast<const char*>(packed_vec.data()), packed_vec_size);
@@ -459,8 +493,6 @@ void save_sketch(const MemoryBank& bank, const std::string& filepath, const Hype
 
 /**
  * load_packed_sketch: Loads a bit-packed file directly into memory.
- * Uses instantaneous Hardware DMA block copies (`std::memcpy`) to bypass billions 
- * of bit-shifting loop iterations.
  */
 PackedSketch load_packed_sketch(const std::string& filepath, HypermashHeader& header) {
     std::FILE* fp = std::fopen(filepath.c_str(), "rb");
@@ -496,7 +528,6 @@ PackedSketch load_packed_sketch(const std::string& filepath, HypermashHeader& he
     for (size_t i = 0; i < sketch.M; ++i) {
         uint8_t* row_bytes = buffer.data() + offset;
         
-        // Fast SWAR emptiness check (Checking 64-bits / 8 bytes at a time)
         bool is_empty = true;
         size_t num_qwords = packed_vec_size / 8;
         uint64_t* qwords = reinterpret_cast<uint64_t*>(row_bytes);
@@ -512,7 +543,6 @@ PackedSketch load_packed_sketch(const std::string& filepath, HypermashHeader& he
         sketch.empty[i] = is_empty ? 1 : 0; 
 
         if (!is_empty) {
-            // Instantaneous direct memory copy of the pre-packed bytes
             std::memcpy(&sketch.bits[i * sketch.num_blocks], row_bytes, packed_vec_size);
         }
         offset += packed_vec_size;
@@ -522,13 +552,9 @@ PackedSketch load_packed_sketch(const std::string& filepath, HypermashHeader& he
 
 /**
  * load_and_tokenize_fasta: Zero-Copy OS Memory Mapping
- * Instead of reading the file into a RAM string, it asks the Unix kernel to map the 
- * physical SSD disk blocks directly into the CPU's virtual memory space via `mmap`. 
- * Characters are parsed and converted to 0-3 integers on the fly using pointer-bumping.
  */
 std::vector<uint8_t> load_and_tokenize_fasta(const std::string& filepath) {
 #ifndef _MSC_VER
-    // UNIX Systems: Hyper-fast mmap (Zero-Copy OS Memory)
     int fd = open(filepath.c_str(), O_RDONLY);
     if (fd == -1) throw std::runtime_error("Could not open FASTA file " + filepath);
 
@@ -539,7 +565,6 @@ std::vector<uint8_t> load_and_tokenize_fasta(const std::string& filepath) {
     char* buffer = static_cast<char*>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
     if (buffer == MAP_FAILED) throw std::runtime_error("mmap failed.");
 
-    // Flat lookup array for blistering-fast translation mapping
     uint8_t char_to_base[256];
     std::fill_n(char_to_base, 256, 255); 
     char_to_base['A'] = 0; char_to_base['a'] = 0;
@@ -547,8 +572,6 @@ std::vector<uint8_t> load_and_tokenize_fasta(const std::string& filepath) {
     char_to_base['G'] = 2; char_to_base['g'] = 2;
     char_to_base['T'] = 3; char_to_base['t'] = 3;
 
-    // POINTER-BUMPING FASTA LOADER
-    // Allocates raw array and uses ptr arithmetic to bypass std::vector bounds checks.
     std::vector<uint8_t> tokenized(size); 
     uint8_t* out_ptr = tokenized.data();
     size_t valid_count = 0;
@@ -558,7 +581,6 @@ std::vector<uint8_t> load_and_tokenize_fasta(const std::string& filepath) {
         char c = buffer[i];
         if (c == '>') {
             in_header = true;
-            // Inject structural scaffold-breaker if transitioning between chromosomes
             if (valid_count > 0 && out_ptr[valid_count - 1] != 255) {
                 out_ptr[valid_count++] = 255; 
             }
@@ -572,7 +594,6 @@ std::vector<uint8_t> load_and_tokenize_fasta(const std::string& filepath) {
             out_ptr[valid_count++] = char_to_base[static_cast<uint8_t>(c)];
         }
     }
-    // Trim unused space
     tokenized.resize(valid_count);
 
     munmap(buffer, size);
@@ -687,7 +708,6 @@ void handle_sketch(const std::vector<std::string>& args) {
     }
 
     HashedGraphEncoder encoder(k, D, M);
-    std::cout << "Processing " << input_file << "..." << std::endl;
     
     std::vector<uint8_t> tokenized_genome = load_and_tokenize_fasta(input_file);
     MemoryBank bank = encoder.encode_single(tokenized_genome, num_threads);
@@ -744,18 +764,29 @@ void handle_dist(const std::vector<std::string>& args) {
             throw std::runtime_error("Sketch parameters do not match.");
         }
 
-        double sim = HashedGraphEncoder::fast_compare_packed_single(b1, b2);
+        double binarized_sim = HashedGraphEncoder::fast_compare_packed_single(b1, b2);
         
-        // Un-distort the binarization topology using Grothendieck's Identity
-        double estimated_jaccard = std::sin(sim * M_PI / 2.0);
+        // 1. Un-distort the binarized cosine back to the continuous geometric cosine (Grothendieck)
+        double continuous_cosine = std::sin(binarized_sim * M_PI / 2.0);
+        
+        // 2. Transform Continuous Cosine to Set-Theory Jaccard Index (Otsuka-Ochiai)
+        double estimated_jaccard = 0.0;
+        if (continuous_cosine > 0.0) {
+            estimated_jaccard = continuous_cosine / (2.0 - continuous_cosine);
+        }
+
+        // 3. Convert to Mash Distance
         double mash_dist = 1.0; 
         if (estimated_jaccard > 0.0) {
             if (estimated_jaccard >= 1.0) mash_dist = 0.0;
-            // Mash Mutation Probability Formula: (-1/k) * ln(Jaccard)
-            else mash_dist = -1.0 / h1.k * std::log(estimated_jaccard);
+            // Hypermash Edge Footprint Formula: (-1 / (k+1)) * ln(Jaccard)
+            else {
+                mash_dist = -1.0 / (h1.k + 1.0) * std::log(estimated_jaccard);
+                if (mash_dist > 1.0) mash_dist = 1.0; // Cap mathematically unbound logarithms
+            }
         }
 
-        std::cout << "Raw HDC Similarity: " << sim << std::endl;
+        std::cout << "Raw HDC Similarity: " << binarized_sim << std::endl;
         std::cout << "Estimated Jaccard:  " << estimated_jaccard << std::endl;
         std::cout << "Est. Mash Distance: " << mash_dist << std::endl;
     } 
@@ -822,15 +853,29 @@ void handle_dist(const std::vector<std::string>& args) {
                     int i = jobs[job_idx].i;
                     int j = jobs[job_idx].j;
                     
-                    double sim = HashedGraphEncoder::fast_compare_packed_single(sketches[i], sketches[j]);
-                    double estimated_jaccard = std::sin(sim * M_PI / 2.0);
+                    double binarized_sim = HashedGraphEncoder::fast_compare_packed_single(sketches[i], sketches[j]);
+                    
+                    // 1. Un-distort Binarized Cosine to Continuous Cosine (Grothendieck's Identity)
+                    double continuous_cosine = std::sin(binarized_sim * M_PI / 2.0);
+                    
+                    // 2. Transform Continuous Cosine to Set-Theory Jaccard Index (Otsuka-Ochiai)
+                    double estimated_jaccard = 0.0;
+                    if (continuous_cosine > 0.0) {
+                        estimated_jaccard = continuous_cosine / (2.0 - continuous_cosine);
+                    }
+
+                    // 3. Convert to Mash Distance
                     double mash_dist = 1.0; 
                     if (estimated_jaccard > 0.0) {
                         if (estimated_jaccard >= 1.0) mash_dist = 0.0;
-                        else mash_dist = -1.0 / k_values[i] * std::log(estimated_jaccard);
+                        // Hypermash Edge Footprint Formula: (-1 / (k+1)) * ln(Jaccard)
+                        else {
+                            mash_dist = -1.0 / (k_values[i] + 1.0) * std::log(estimated_jaccard);
+                            if (mash_dist > 1.0) mash_dist = 1.0; // Cap mathematically unbound logarithms
+                        }
                     }
                     
-                    ss << names[i] << "\t" << names[j] << "\t" << sim << "\t" << mash_dist << "\n";
+                    ss << names[i] << "\t" << names[j] << "\t" << binarized_sim << "\t" << mash_dist << "\n";
                 }
                 thread_outputs[t] = ss.str();
             });
