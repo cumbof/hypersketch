@@ -29,25 +29,18 @@
 #include <memory>
 
 // OS-Level Memory Mapping for Zero-Copy I/O (UNIX/Linux/macOS)
-#ifndef _MSC_VER
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-// Hardware-level popcount instruction mapping.
+// Hardware-level popcount instruction mapping (GCC/Clang).
 // Popcount counts the number of '1' bits in an integer in a single CPU cycle.
-#ifdef _MSC_VER
-#include <intrin.h>
-#define POPCOUNT64 __popcnt64
-#else
 #define POPCOUNT64 __builtin_popcountll
-#endif
 
 // Define software version
 const std::string HYPERMASH_VERSION = "1.0";
@@ -208,10 +201,15 @@ public:
                     if (valid_bases >= k) {
                         uint64_t current_canonical = std::min(kmer_fwd, kmer_rev);
                         if (valid_bases > k && j >= start) {
-                            // Extract graph edge: Node A (bucket) -> Node B (target_hash)
-                            uint64_t prev_seed = deterministic_hash_kmer(prev_canonical, k);
-                            uint32_t bucket = static_cast<uint32_t>(prev_seed % M);
-                            uint64_t target_hash = deterministic_hash_kmer(current_canonical, k);
+                            // Treat the sequence graph as undirected by ordering the edge nodes lexicographically.
+                            // This ensures that FWD (A->B) and REV (rev(B)->rev(A)) produce the exact same edge,
+                            // allowing Hypermash to perfectly match reverse-complemented contigs.
+                            uint64_t min_node = std::min(prev_canonical, current_canonical);
+                            uint64_t max_node = std::max(prev_canonical, current_canonical);
+
+                            uint64_t source_seed = deterministic_hash_kmer(min_node, k);
+                            uint32_t bucket = static_cast<uint32_t>(source_seed % M);
+                            uint64_t target_hash = deterministic_hash_kmer(max_node, k);
                             
                             // Save to thread-local Data-Oriented arrays
                             data.buckets[data.count] = bucket;
@@ -554,7 +552,6 @@ PackedSketch load_packed_sketch(const std::string& filepath, HypermashHeader& he
  * load_and_tokenize_fasta: Zero-Copy OS Memory Mapping
  */
 std::vector<uint8_t> load_and_tokenize_fasta(const std::string& filepath) {
-#ifndef _MSC_VER
     int fd = open(filepath.c_str(), O_RDONLY);
     if (fd == -1) throw std::runtime_error("Could not open FASTA file " + filepath);
 
@@ -599,52 +596,6 @@ std::vector<uint8_t> load_and_tokenize_fasta(const std::string& filepath) {
     munmap(buffer, size);
     close(fd);
     return tokenized;
-#else
-    // Windows Fallback using standard block fread
-    std::FILE* fp = std::fopen(filepath.c_str(), "rb");
-    if (!fp) throw std::runtime_error("Could not open FASTA file " + filepath);
-    
-    std::fseek(fp, 0, SEEK_END);
-    size_t size = std::ftell(fp);
-    std::rewind(fp);
-    
-    std::vector<char> buffer(size);
-    size_t read_size = std::fread(buffer.data(), 1, size, fp);
-    std::fclose(fp);
-
-    uint8_t char_to_base[256];
-    std::fill_n(char_to_base, 256, 255); 
-    char_to_base['A'] = 0; char_to_base['a'] = 0;
-    char_to_base['C'] = 1; char_to_base['c'] = 1;
-    char_to_base['G'] = 2; char_to_base['g'] = 2;
-    char_to_base['T'] = 3; char_to_base['t'] = 3;
-
-    std::vector<uint8_t> tokenized(read_size); 
-    uint8_t* out_ptr = tokenized.data();
-    size_t valid_count = 0;
-    bool in_header = false;
-
-    for (size_t i = 0; i < read_size; ++i) {
-        char c = buffer[i];
-        if (c == '>') {
-            in_header = true;
-            if (valid_count > 0 && out_ptr[valid_count - 1] != 255) {
-                out_ptr[valid_count++] = 255;
-            }
-            continue;
-        }
-        if (c == '\n' || c == '\r') {
-            in_header = false;
-            continue;
-        }
-        if (!in_header && c != ' ' && c != '\t') {
-            out_ptr[valid_count++] = char_to_base[static_cast<uint8_t>(c)];
-        }
-    }
-    tokenized.resize(valid_count);
-
-    return tokenized;
-#endif
 }
 
 //==============================================================================
@@ -662,6 +613,7 @@ void print_help() {
               << "Commands:\n"
               << "  sketch      Create a compact sketch from a single FASTA file.\n"
               << "  dist        Calculate similarity between two sketch files.\n"
+              << "  recall      Calculate the edge reconstruction rate (Recall) of a sketch against its original FASTA.\n"
               << "  info        Display metadata and information about a sketch file.\n"
               << "  version     Print the software version.\n"
               << "  help        Show this help message.\n\n"
@@ -792,7 +744,7 @@ void handle_dist(const std::vector<std::string>& args) {
     } 
     // Execution path for Matrix Batch Processing (All-vs-All)
     else {
-        std::cerr << "Loading: " << files.size() << " sketches mapped directly to RAM..." << std::endl;
+        std::cerr << "Loading: " << files.size() << std::endl;
         std::vector<PackedSketch> sketches(files.size());
         std::vector<std::string> names(files.size());
         std::vector<int> k_values(files.size());
@@ -891,6 +843,131 @@ void handle_dist(const std::vector<std::string>& args) {
     }
 }
 
+void handle_recall(const std::vector<std::string>& args) {
+    if (args.size() != 4) throw std::runtime_error("Usage: hypermash recall <sketch.hms> <genome.fna>");
+    std::string sketch_file = args[2];
+    std::string fasta_file = args[3];
+
+    HypermashHeader header;
+    PackedSketch sketch = load_packed_sketch(sketch_file, header);
+    if (sketch.M == 0) throw std::runtime_error("Empty sketch.");
+
+    int k = header.k;
+    int D = header.D;
+    size_t M = header.M;
+    uint64_t kmer_mask = (k == 32) ? ~0ULL : (1ULL << (2 * k)) - 1;
+
+    std::vector<uint8_t> tokenized = load_and_tokenize_fasta(fasta_file);
+    
+    struct Edge { uint64_t source; uint64_t target; uint32_t bucket; };
+    std::vector<Edge> edges;
+    
+    uint64_t kmer_fwd = 0, kmer_rev = 0, prev_canonical = 0;
+    int valid_bases = 0;
+    
+    for (size_t j = 0; j < tokenized.size(); ++j) {
+        uint8_t base = tokenized[j];
+        if (base > 3) { valid_bases = 0; continue; }
+        kmer_fwd = ((kmer_fwd << 2) | base) & kmer_mask;
+        uint64_t rev_base = (~base) & 3;
+        kmer_rev = (kmer_rev >> 2) | (rev_base << (2 * (k - 1)));
+        valid_bases++;
+
+        if (valid_bases >= k) {
+            uint64_t current_canonical = std::min(kmer_fwd, kmer_rev);
+            if (valid_bases > k) {
+                uint64_t min_node = std::min(prev_canonical, current_canonical);
+                uint64_t max_node = std::max(prev_canonical, current_canonical);
+                uint64_t source_seed = deterministic_hash_kmer(min_node, k);
+                uint32_t bucket = static_cast<uint32_t>(source_seed % M);
+                uint64_t target_hash = deterministic_hash_kmer(max_node, k);
+                edges.push_back({source_seed, target_hash, bucket});
+            }
+            prev_canonical = current_canonical;
+        }
+    }
+    
+    // Isolate Unique Edges
+    auto edge_cmp = [](const Edge& a, const Edge& b) {
+        if (a.source != b.source) return a.source < b.source;
+        return a.target < b.target;
+    };
+    std::sort(edges.begin(), edges.end(), edge_cmp);
+    edges.erase(std::unique(edges.begin(), edges.end(), [](const Edge& a, const Edge& b){
+        return a.source == b.source && a.target == b.target;
+    }), edges.end());
+
+    // --- NEW: COMPUTE QUERY BUCKET DENSITIES ---
+    std::vector<uint32_t> bucket_densities(M, 0);
+    for (const auto& e : edges) {
+        bucket_densities[e.bucket]++;
+    }
+
+    // Query the HDC sketch
+    size_t recovered = 0;
+    int full_blocks = D / 64;
+    int leftover = D % 64;
+    const uint64_t WEYL_MAGIC = 0x9e3779b97f4a7c15ULL;
+
+    // Define the absolute statistical noise floor (5-sigma deviation from a random 50% mismatch)
+    double stddev_hamming = std::sqrt(static_cast<double>(D)) / 2.0;
+    double noise_floor = (static_cast<double>(D) / 2.0) - (5.0 * stddev_hamming);
+
+    for (const auto& e : edges) {
+        if (sketch.empty[e.bucket]) continue; // Bucket empty, edge lost to noise
+        
+        // Estimate the signal degradation based on the query genome's bucket density (N).
+        // Expected continuous cosine similarity degrades proportionally to 1/sqrt(N).
+        uint32_t N = bucket_densities[e.bucket];
+        double expected_cosine = (N > 0) ? (1.0 / std::sqrt(static_cast<double>(N))) : 0.0;
+        double expected_bin_cosine = (2.0 / M_PI) * std::asin(expected_cosine);
+        double expected_hamming = (D / 2.0) * (1.0 - expected_bin_cosine);
+        
+        // Allow a 3-sigma statistical variance for the true signal to fluctuate.
+        double dynamic_threshold = expected_hamming + (3.0 * stddev_hamming);
+        
+        // The threshold strictly caps at the 5-sigma noise floor. 
+        // If a bucket is so dense that its expected signal drops into the noise floor, 
+        // it correctly fails the check, registering the edge as unrecoverable.
+        uint64_t detection_threshold = static_cast<uint64_t>(std::min(dynamic_threshold, noise_floor));
+
+        const uint64_t* sketch_row = &sketch.bits[e.bucket * sketch.num_blocks];
+        uint64_t current_z = e.target;
+        uint64_t hamming = 0;
+        
+        // Regenerate the exact binary target vector and compute POPCOUNT XOR against the sketch row
+        for (int b = 0; b < full_blocks; ++b) {
+            uint64_t z = current_z;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            uint64_t r = z ^ (z >> 31);
+            current_z += WEYL_MAGIC;
+            hamming += POPCOUNT64(r ^ sketch_row[b]);
+        }
+        if (leftover > 0) {
+            uint64_t z = current_z;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            uint64_t r = z ^ (z >> 31);
+            uint64_t mask = (1ULL << leftover) - 1;
+            hamming += POPCOUNT64((r ^ sketch_row[full_blocks]) & mask);
+        }
+        
+        // If the Hamming distance successfully beats the 5-sigma noise floor, 
+        // the edge is unambiguously present in the memory bank superposition.
+        if (hamming <= detection_threshold) {
+            recovered++;
+        }
+    }
+    
+    double recall = (edges.empty()) ? 0.0 : (static_cast<double>(recovered) / edges.size());
+    
+    // Output clean TSV row to std::cout: Genome_Path | Sketch_Path | Recall (0-1) | Hits/Total
+    std::cout << fasta_file << "\t" << sketch_file << "\t" 
+              << std::fixed << std::setprecision(6) << recall << "\t" 
+              << recovered << "/" << edges.size() << "\n";
+}
+
 void handle_info(const std::vector<std::string>& args) {
     if (args.size() != 3) throw std::runtime_error("info command requires exactly one sketch file.");
     std::string file = args[2];
@@ -916,6 +993,7 @@ int main(int argc, char* argv[]) {
     try {
         if (command == "sketch") handle_sketch(args);
         else if (command == "dist") handle_dist(args);
+        else if (command == "recall") handle_recall(args);
         else if (command == "info") handle_info(args);
         else if (command == "version") std::cout << "Hypermash version " << HYPERMASH_VERSION << std::endl;
         else if (command == "help" || command == "--help" || command == "-h") print_help();
