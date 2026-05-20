@@ -11,7 +11,9 @@
 // Explicit hardware vectorization pragmas to force the compiler to utilize 256-bit registers.
 // This allows the CPU to process 8 dimensions simultaneously per clock cycle.
 #pragma GCC optimize("O3,unroll-loops,fast-math")
+#ifdef __x86_64__
 #pragma GCC target("avx2,bmi,bmi2,lzcnt,popcnt")
+#endif
 
 #include <iostream>
 #include <fstream>
@@ -986,6 +988,7 @@ void handle_info(const std::vector<std::string>& args) {
               << "- " << header.source_file << "\n";
 }
 
+#ifndef HYPERMASH_TEST_BUILD
 int main(int argc, char* argv[]) {
     if (argc < 2) { print_help(); return 1; }
     std::vector<std::string> args(argv, argv + argc);
@@ -1004,3 +1007,4 @@ int main(int argc, char* argv[]) {
     }
     return 0;
 }
+#endif // HYPERMASH_TEST_BUILD

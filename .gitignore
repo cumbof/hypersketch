@@ -1,0 +1,5 @@
+hypermash
+tests/test_unit
+tests/__pycache__/
+tests/fixtures/*.hms
+*.pyc
