@@ -1,5 +1,6 @@
 hypermash
 tests/test_unit
+tests/catch.hpp
 tests/__pycache__/
 tests/fixtures/*.hms
 *.pyc
