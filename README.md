@@ -1,12 +1,12 @@
-# hypermash
+# hypersketch
 
 Graph-Based Genome Sketching via Hyperdimensional Computing
 
 ## Overview
 
-Hypermash is a high-performance bioinformatics engine designed to compute evolutionary distances between genomes.
+HyperSketch is a high-performance bioinformatics engine designed to compute evolutionary distances between genomes.
 
-Unlike traditional MinHash approaches that compare unstructured sets of k-mers (a "bag-of-words"), Hypermash sketches the topological structure of the _de Bruijn_ sequence graph. By encoding the transitions (edges) between adjacent k-mers, Hypermash captures genomic syntax and structural variation. It utilizes Hyperdimensional Computing (HDC) to compress this vast graphical topology into a fixed-size, heavily binarized matrix representation called a Memory Bank.
+Unlike traditional MinHash approaches that compare unstructured sets of k-mers (a "bag-of-words"), HyperSketch sketches the topological structure of the _de Bruijn_ sequence graph. By encoding the transitions (edges) between adjacent k-mers, HyperSketch captures genomic syntax and structural variation. It utilizes Hyperdimensional Computing (HDC) to compress this vast graphical topology into a fixed-size, heavily binarized matrix representation called a Memory Bank.
 
 The underlying C++ engine is aggressively optimized for bare-metal hardware performance, utilizing Zero-Copy OS Memory Mapping, Data-Oriented Design (SoA), SIMD AVX2 vectorization, L1-cache locking, and Statistical Adaptive Error Mitigation.
 
@@ -46,7 +46,7 @@ The genome is chunked across available CPU threads. For every valid edge (source
 
 ### 3. Data-Oriented Counting Sort (Scatter)
 
-To prevent RAM cache thrashing, Hypermash utilizes Data-Oriented Design (Structure of Arrays). Thread-local edges are mapped using flattened Prefix Sums. An $O(N)$ parallel Counting Sort groups all edges destined for the same memory bucket into perfectly contiguous memory blocks.
+To prevent RAM cache thrashing, HyperSketch utilizes Data-Oriented Design (Structure of Arrays). Thread-local edges are mapped using flattened Prefix Sums. An $O(N)$ parallel Counting Sort groups all edges destined for the same memory bucket into perfectly contiguous memory blocks.
 
 ### 4. L1-Cache Locked Vector Generation
 
@@ -55,7 +55,7 @@ Instead of doing sequential bit-math, an 8KB Global Lookup Table (LUT) translate
 
 ### 5. Statistical Adaptive Error Mitigation (Retraining)
 
-To mitigate hash-collision interference without inflating the Memory Bank size, Hypermash employs a dynamic, data-driven error mitigation algorithm.
+To mitigate hash-collision interference without inflating the Memory Bank size, HyperSketch employs a dynamic, data-driven error mitigation algorithm.
 
 - For each memory bucket, the engine calculates the true Mean ($\mu$) and Standard Deviation ($\sigma$) of the constituent edge similarities.
 
@@ -65,7 +65,7 @@ To mitigate hash-collision interference without inflating the Memory Bank size, 
 
 ## Comparison Algorithm & Distance Estimation
 
-To compare two genomes, Hypermash executes a parallel, lock-free matrix boarding process:
+To compare two genomes, HyperSketch executes a parallel, lock-free matrix boarding process:
 
 1. __Hardware POPCOUNT:__ Because the final sketches are bit-packed, the comparison uses hardware-level __builtin_popcountll and bitwise XOR gates to compute the Hamming distance between aligned memory buckets at blazing speeds.
 
@@ -78,9 +78,9 @@ To compare two genomes, Hypermash executes a parallel, lock-free matrix boarding
 ## Usage
 
 ```text
-Hypermash (v1.0)
+HyperSketch (v1.0)
 
-Usage: hypermash <command> [options] <input_file>
+Usage: hypersketch <command> [options] <input_file>
 
 Commands:
   sketch      Create a compact sketch from a single FASTA file.
@@ -111,6 +111,6 @@ Options:
 
 ## Credits
 
-If you use Hypermash in your work, please cite:
+If you use HyperSketch in your work, please cite:
 
 > _Manuscript in preparation_

@@ -7,10 +7,10 @@ TESTFLAGS := -O1 -g -std=c++17 -pthread -march=native
 # ---------------------------------------------------------------------------
 # Default target: build the main binary
 # ---------------------------------------------------------------------------
-all: hypermash
+all: hypersketch
 
-hypermash: hypermash.cpp
-	$(CXX) $(CXXFLAGS) hypermash.cpp -o hypermash
+hypersketch: hypersketch.cpp
+	$(CXX) $(CXXFLAGS) hypersketch.cpp -o hypersketch
 
 # ---------------------------------------------------------------------------
 # Test targets
@@ -23,14 +23,14 @@ tests/catch.hpp:
 	     -o tests/catch.hpp
 
 ## Build and run C++ unit tests
-tests/test_unit: tests/test_unit.cpp hypermash.cpp tests/catch.hpp
-	$(CXX) $(TESTFLAGS) -DHYPERMASH_TEST_BUILD tests/test_unit.cpp -o tests/test_unit
+tests/test_unit: tests/test_unit.cpp hypersketch.cpp tests/catch.hpp
+	$(CXX) $(TESTFLAGS) -DHYPERSKETCH_TEST_BUILD tests/test_unit.cpp -o tests/test_unit
 
 test-unit: tests/test_unit
 	./tests/test_unit
 
-## Build hypermash and run Python integration tests
-test-integration: hypermash
+## Build hypersketch and run Python integration tests
+test-integration: hypersketch
 	python3 -m pytest tests/test_integration.py -v
 
 ## Run all tests
@@ -40,4 +40,4 @@ test: test-unit test-integration
 # Clean
 # ---------------------------------------------------------------------------
 clean:
-	rm -f hypermash tests/test_unit tests/fixtures/*.hms
+	rm -f hypersketch tests/test_unit tests/fixtures/*.hms

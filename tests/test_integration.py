@@ -1,7 +1,7 @@
 """
-Hypermash integration tests.
+HyperSketch integration tests.
 
-These tests exercise the compiled ``hypermash`` binary end-to-end through its
+These tests exercise the compiled ``hypersketch`` binary end-to-end through its
 CLI, covering all commands and key error-handling paths.  They are intentionally
 written to be familiar to anyone who knows Python's standard ``pytest``.
 
@@ -18,7 +18,7 @@ import subprocess
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BINARY    = os.path.join(REPO_ROOT, "hypermash")
+BINARY    = os.path.join(REPO_ROOT, "hypersketch")
 FIXTURES  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
 SIMPLE_FASTA     = os.path.join(FIXTURES, "simple.fna")
@@ -31,7 +31,7 @@ MULTICONTIG_FASTA = os.path.join(FIXTURES, "multi_contig.fna")
 # ---------------------------------------------------------------------------
 
 def run(*args, **kwargs):
-    """Run the hypermash binary and return a CompletedProcess."""
+    """Run the hypersketch binary and return a CompletedProcess."""
     return subprocess.run(
         [BINARY, *args],
         capture_output=True,
@@ -56,13 +56,13 @@ def mash_dist_from(output: str) -> float:
 def built_binary():
     result = subprocess.run(
         ["g++", "-O3", "-std=c++17", "-pthread", "-march=native",
-         "hypermash.cpp", "-o", "hypermash"],
+         "hypersketch.cpp", "-o", "hypersketch"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
-        pytest.fail(f"Failed to build hypermash:\n{result.stderr}")
+        pytest.fail(f"Failed to build hypersketch:\n{result.stderr}")
 
 
 # ---------------------------------------------------------------------------

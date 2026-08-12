@@ -1,11 +1,11 @@
 /**
- * HYPERMASH
+ * HYPERSKETCH
  * 
- * Hypermash uses Hyperdimensional Computing (HDC) to encode the topology of De Bruijn 
+ * HyperSketch uses Hyperdimensional Computing (HDC) to encode the topology of De Bruijn 
  * sequence graphs into binarized hypervectors. Unlike "bag-of-words" MinHash approaches, 
- * Hypermash preserves structural variation data (edges between adjacent k-mers).
+ * HyperSketch preserves structural variation data (edges between adjacent k-mers).
  * 
- * g++ -O3 -std=c++17 -pthread -march=native hypermash.cpp -o hypermash
+ * g++ -O3 -std=c++17 -pthread -march=native hypersketch.cpp -o hypersketch
  */
 
 // Explicit hardware vectorization pragmas to force the compiler to utilize 256-bit registers.
@@ -45,7 +45,7 @@
 #define POPCOUNT64 __builtin_popcountll
 
 // Define software version
-const std::string HYPERMASH_VERSION = "1.0";
+const std::string HYPERSKETCH_VERSION = "1.0";
 
 //==============================================================================
 // Global L1 Cache Lookup Table (LUT) for AVX2 Vectorization
@@ -205,7 +205,7 @@ public:
                         if (valid_bases > k && j >= start) {
                             // Treat the sequence graph as undirected by ordering the edge nodes lexicographically.
                             // This ensures that FWD (A->B) and REV (rev(B)->rev(A)) produce the exact same edge,
-                            // allowing Hypermash to perfectly match reverse-complemented contigs.
+                            // allowing HyperSketch to perfectly match reverse-complemented contigs.
                             uint64_t min_node = std::min(prev_canonical, current_canonical);
                             uint64_t max_node = std::max(prev_canonical, current_canonical);
 
@@ -410,7 +410,7 @@ private:
 //==============================================================================
 // File I/O
 //==============================================================================
-struct HypermashHeader {
+struct HyperSketchHeader {
     uint32_t magic_number = 0x484D5348; // ASCII "HMSH"
     char version[16];
     int k;
@@ -422,11 +422,11 @@ struct HypermashHeader {
 /**
  * save_sketch: Compresses the integer MemoryBank into a binary bit-packed file.
  */
-void save_sketch(const MemoryBank& bank, const std::string& filepath, const HypermashHeader& header) {
+void save_sketch(const MemoryBank& bank, const std::string& filepath, const HyperSketchHeader& header) {
     std::ofstream outfile(filepath, std::ios::binary);
     if (!outfile) throw std::runtime_error("Cannot open file for writing: " + filepath);
 
-    outfile.write(reinterpret_cast<const char*>(&header), sizeof(HypermashHeader));
+    outfile.write(reinterpret_cast<const char*>(&header), sizeof(HyperSketchHeader));
     if (bank.empty()) return;
 
     size_t packed_vec_size = header.D / 8;
@@ -494,7 +494,7 @@ void save_sketch(const MemoryBank& bank, const std::string& filepath, const Hype
 /**
  * load_packed_sketch: Loads a bit-packed file directly into memory.
  */
-PackedSketch load_packed_sketch(const std::string& filepath, HypermashHeader& header) {
+PackedSketch load_packed_sketch(const std::string& filepath, HyperSketchHeader& header) {
     std::FILE* fp = std::fopen(filepath.c_str(), "rb");
     if (!fp) throw std::runtime_error("Cannot open sketch file " + filepath);
     
@@ -510,8 +510,8 @@ PackedSketch load_packed_sketch(const std::string& filepath, HypermashHeader& he
     }
     std::fclose(fp);
 
-    std::memcpy(&header, buffer.data(), sizeof(HypermashHeader));
-    if (header.magic_number != 0x484D5348) throw std::runtime_error("Not a valid Hypermash file.");
+    std::memcpy(&header, buffer.data(), sizeof(HyperSketchHeader));
+    if (header.magic_number != 0x484D5348) throw std::runtime_error("Not a valid HyperSketch file.");
 
     PackedSketch sketch;
     sketch.M = header.M;
@@ -523,7 +523,7 @@ PackedSketch load_packed_sketch(const std::string& filepath, HypermashHeader& he
     sketch.empty.resize(sketch.M, 0);
 
     size_t packed_vec_size = header.D / 8;
-    size_t offset = sizeof(HypermashHeader);
+    size_t offset = sizeof(HyperSketchHeader);
 
     for (size_t i = 0; i < sketch.M; ++i) {
         uint8_t* row_bytes = buffer.data() + offset;
@@ -610,8 +610,8 @@ unsigned int get_default_threads() {
 }
 
 void print_help() {
-    std::cout << "Hypermash (v" << HYPERMASH_VERSION << ")\n\n"
-              << "Usage: hypermash <command> [options] <input_file>\n\n"
+    std::cout << "HyperSketch (v" << HYPERSKETCH_VERSION << ")\n\n"
+              << "Usage: hypersketch <command> [options] <input_file>\n\n"
               << "Commands:\n"
               << "  sketch      Create a compact sketch from a single FASTA file.\n"
               << "  dist        Calculate similarity between two sketch files.\n"
@@ -666,8 +666,8 @@ void handle_sketch(const std::vector<std::string>& args) {
     std::vector<uint8_t> tokenized_genome = load_and_tokenize_fasta(input_file);
     MemoryBank bank = encoder.encode_single(tokenized_genome, num_threads);
 
-    HypermashHeader header;
-    strncpy(header.version, HYPERMASH_VERSION.c_str(), 15); header.version[15] = '\0';
+    HyperSketchHeader header;
+    strncpy(header.version, HYPERSKETCH_VERSION.c_str(), 15); header.version[15] = '\0';
     header.k = k; header.D = D; header.M = M;
     strncpy(header.source_file, input_file.c_str(), 255); header.source_file[255] = '\0';
 
@@ -710,7 +710,7 @@ void handle_dist(const std::vector<std::string>& args) {
 
     // Execution path for a simple two-file comparison
     if (files.size() == 2) {
-        HypermashHeader h1, h2;
+        HyperSketchHeader h1, h2;
         PackedSketch b1 = load_packed_sketch(files[0], h1);
         PackedSketch b2 = load_packed_sketch(files[1], h2);
 
@@ -733,7 +733,7 @@ void handle_dist(const std::vector<std::string>& args) {
         double mash_dist = 1.0; 
         if (estimated_jaccard > 0.0) {
             if (estimated_jaccard >= 1.0) mash_dist = 0.0;
-            // Hypermash Edge Footprint Formula: (-1 / (k+1)) * ln(Jaccard)
+            // HyperSketch Edge Footprint Formula: (-1 / (k+1)) * ln(Jaccard)
             else {
                 mash_dist = -1.0 / (h1.k + 1.0) * std::log(estimated_jaccard);
                 if (mash_dist > 1.0) mash_dist = 1.0; // Cap mathematically unbound logarithms
@@ -759,7 +759,7 @@ void handle_dist(const std::vector<std::string>& args) {
                 size_t start = t * files_per_thread;
                 size_t end = std::min(start + files_per_thread, files.size());
                 for (size_t i = start; i < end; ++i) {
-                    HypermashHeader h;
+                    HyperSketchHeader h;
                     sketches[i] = load_packed_sketch(files[i], h);
                     k_values[i] = h.k;
                     
@@ -822,7 +822,7 @@ void handle_dist(const std::vector<std::string>& args) {
                     double mash_dist = 1.0; 
                     if (estimated_jaccard > 0.0) {
                         if (estimated_jaccard >= 1.0) mash_dist = 0.0;
-                        // Hypermash Edge Footprint Formula: (-1 / (k+1)) * ln(Jaccard)
+                        // HyperSketch Edge Footprint Formula: (-1 / (k+1)) * ln(Jaccard)
                         else {
                             mash_dist = -1.0 / (k_values[i] + 1.0) * std::log(estimated_jaccard);
                             if (mash_dist > 1.0) mash_dist = 1.0; // Cap mathematically unbound logarithms
@@ -846,11 +846,11 @@ void handle_dist(const std::vector<std::string>& args) {
 }
 
 void handle_recall(const std::vector<std::string>& args) {
-    if (args.size() != 4) throw std::runtime_error("Usage: hypermash recall <sketch.hms> <genome.fna>");
+    if (args.size() != 4) throw std::runtime_error("Usage: hypersketch recall <sketch.hms> <genome.fna>");
     std::string sketch_file = args[2];
     std::string fasta_file = args[3];
 
-    HypermashHeader header;
+    HyperSketchHeader header;
     PackedSketch sketch = load_packed_sketch(sketch_file, header);
     if (sketch.M == 0) throw std::runtime_error("Empty sketch.");
 
@@ -973,11 +973,11 @@ void handle_recall(const std::vector<std::string>& args) {
 void handle_info(const std::vector<std::string>& args) {
     if (args.size() != 3) throw std::runtime_error("info command requires exactly one sketch file.");
     std::string file = args[2];
-    HypermashHeader header;
+    HyperSketchHeader header;
 
     load_packed_sketch(file, header); 
 
-    std::cout << "--- Hypermash Sketch Info ---\n"
+    std::cout << "--- HyperSketch Sketch Info ---\n"
               << "File Path:          " << file << "\n"
               << "Sketch Version:     " << header.version << "\n"
               << "--- Parameters ---\n"
@@ -988,7 +988,7 @@ void handle_info(const std::vector<std::string>& args) {
               << "- " << header.source_file << "\n";
 }
 
-#ifndef HYPERMASH_TEST_BUILD
+#ifndef HYPERSKETCH_TEST_BUILD
 int main(int argc, char* argv[]) {
     if (argc < 2) { print_help(); return 1; }
     std::vector<std::string> args(argv, argv + argc);
@@ -998,13 +998,13 @@ int main(int argc, char* argv[]) {
         else if (command == "dist") handle_dist(args);
         else if (command == "recall") handle_recall(args);
         else if (command == "info") handle_info(args);
-        else if (command == "version") std::cout << "Hypermash version " << HYPERMASH_VERSION << std::endl;
+        else if (command == "version") std::cout << "HyperSketch version " << HYPERSKETCH_VERSION << std::endl;
         else if (command == "help" || command == "--help" || command == "-h") print_help();
-        else { std::cerr << "Error: Unknown command '" << command << "'. Use 'hypermash help'.\n"; return 1; }
+        else { std::cerr << "Error: Unknown command '" << command << "'. Use 'hypersketch help'.\n"; return 1; }
     } catch (const std::exception& e) {
         std::cerr << "An error occurred: " << e.what() << std::endl;
         return 1;
     }
     return 0;
 }
-#endif // HYPERMASH_TEST_BUILD
+#endif // HYPERSKETCH_TEST_BUILD

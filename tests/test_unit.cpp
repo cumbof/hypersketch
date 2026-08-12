@@ -1,8 +1,8 @@
 /**
- * Hypermash Unit Tests
+ * HyperSketch Unit Tests
  *
  * Tests the internal C++ functions directly by including the source file
- * with HYPERMASH_TEST_BUILD defined, which strips out main().
+ * with HYPERSKETCH_TEST_BUILD defined, which strips out main().
  *
  * Framework: Catch2 v2 (single-header, auto-downloaded by the Makefile)
  *
@@ -14,8 +14,8 @@
 #include "catch.hpp"
 
 // Include the full implementation, excluding main()
-#define HYPERMASH_TEST_BUILD
-#include "../hypermash.cpp"
+#define HYPERSKETCH_TEST_BUILD
+#include "../hypersketch.cpp"
 
 #include <fstream>
 #include <cstdio>
@@ -273,7 +273,7 @@ TEST_CASE("save_sketch / load_packed_sketch round-trip preserves header fields",
     MemoryBank bank(M * D, 0);
     for (size_t i = 0; i < M * D; i++) bank[i] = static_cast<int>(i % 3) - 1; // -1, 0, +1
 
-    HypermashHeader hdr;
+    HyperSketchHeader hdr;
     hdr.magic_number = 0x484D5348;
     strncpy(hdr.version, "1.0", 15);
     hdr.k = 9; hdr.D = D; hdr.M = M;
@@ -282,7 +282,7 @@ TEST_CASE("save_sketch / load_packed_sketch round-trip preserves header fields",
     auto path = write_temp_file("", ".hms");
     save_sketch(bank, path, hdr);
 
-    HypermashHeader loaded_hdr;
+    HyperSketchHeader loaded_hdr;
     PackedSketch sketch = load_packed_sketch(path, loaded_hdr);
     remove_file(path);
 
@@ -299,17 +299,17 @@ TEST_CASE("load_packed_sketch throws on an invalid magic number", "[io]") {
     auto path = write_temp_file("", ".hms");
     {
         std::ofstream f(path, std::ios::binary);
-        uint8_t garbage[sizeof(HypermashHeader)] = {};
+        uint8_t garbage[sizeof(HyperSketchHeader)] = {};
         f.write(reinterpret_cast<char*>(garbage), sizeof(garbage));
     }
-    HypermashHeader hdr;
+    HyperSketchHeader hdr;
     REQUIRE_THROWS(load_packed_sketch(path, hdr));
     remove_file(path);
 }
 
 TEST_CASE("save_sketch throws when the output directory does not exist", "[io]") {
     MemoryBank bank(4 * 64, 0);
-    HypermashHeader hdr;
+    HyperSketchHeader hdr;
     hdr.magic_number = 0x484D5348;
     strncpy(hdr.version, "1.0", 15);
     hdr.k = 4; hdr.D = 64; hdr.M = 4;
@@ -330,7 +330,7 @@ TEST_CASE("encoding the same sequence twice produces identical sketches (full pi
 
     MemoryBank bank = enc.encode_single(seq, 1);
 
-    HypermashHeader hdr;
+    HyperSketchHeader hdr;
     hdr.magic_number = 0x484D5348;
     strncpy(hdr.version, "1.0", 15);
     hdr.k = 4; hdr.D = D; hdr.M = M;
@@ -341,7 +341,7 @@ TEST_CASE("encoding the same sequence twice produces identical sketches (full pi
     save_sketch(bank, path1, hdr);
     save_sketch(bank, path2, hdr);
 
-    HypermashHeader h1, h2;
+    HyperSketchHeader h1, h2;
     PackedSketch s1 = load_packed_sketch(path1, h1);
     PackedSketch s2 = load_packed_sketch(path2, h2);
     remove_file(path1);
