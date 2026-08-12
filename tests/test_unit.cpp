@@ -279,7 +279,7 @@ TEST_CASE("save_sketch / load_packed_sketch round-trip preserves header fields",
     hdr.k = 9; hdr.D = D; hdr.M = M;
     strncpy(hdr.source_file, "test.fna", 255);
 
-    auto path = write_temp_file("", ".hms");
+    auto path = write_temp_file("", ".hs");
     save_sketch(bank, path, hdr);
 
     HyperSketchHeader loaded_hdr;
@@ -296,7 +296,7 @@ TEST_CASE("save_sketch / load_packed_sketch round-trip preserves header fields",
 }
 
 TEST_CASE("load_packed_sketch throws on an invalid magic number", "[io]") {
-    auto path = write_temp_file("", ".hms");
+    auto path = write_temp_file("", ".hs");
     {
         std::ofstream f(path, std::ios::binary);
         uint8_t garbage[sizeof(HyperSketchHeader)] = {};
@@ -313,7 +313,7 @@ TEST_CASE("save_sketch throws when the output directory does not exist", "[io]")
     hdr.magic_number = 0x484D5348;
     strncpy(hdr.version, "1.0", 15);
     hdr.k = 4; hdr.D = 64; hdr.M = 4;
-    REQUIRE_THROWS(save_sketch(bank, "/nonexistent/dir/out.hms", hdr));
+    REQUIRE_THROWS(save_sketch(bank, "/nonexistent/dir/out.hs", hdr));
 }
 
 // ===========================================================================
@@ -336,8 +336,8 @@ TEST_CASE("encoding the same sequence twice produces identical sketches (full pi
     hdr.k = 4; hdr.D = D; hdr.M = M;
     strncpy(hdr.source_file, "test.fna", 255);
 
-    auto path1 = write_temp_file("", ".hms");
-    auto path2 = write_temp_file("", ".hms");
+    auto path1 = write_temp_file("", ".hs");
+    auto path2 = write_temp_file("", ".hs");
     save_sketch(bank, path1, hdr);
     save_sketch(bank, path2, hdr);
 

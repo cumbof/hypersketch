@@ -101,13 +101,13 @@ class TestSketchCommand:
         out = str(tmp_path / "out")
         r = run("sketch", "-k", "4", "-d", "256", "-m", "64", "-o", out, SIMPLE_FASTA)
         assert r.returncode == 0, r.stderr
-        assert os.path.exists(out + ".hms")
+        assert os.path.exists(out + ".hs")
 
     def test_sketch_hms_starts_with_magic_bytes(self, tmp_path):
         out = str(tmp_path / "out")
         run("sketch", "-k", "4", "-d", "256", "-m", "64", "-o", out, SIMPLE_FASTA)
         import struct
-        with open(out + ".hms", "rb") as f:
+        with open(out + ".hs", "rb") as f:
             magic = struct.unpack("<I", f.read(4))[0]  # little-endian uint32
         assert magic == 0x484D5348  # "HMSH" as a 32-bit integer
 
@@ -116,7 +116,7 @@ class TestSketchCommand:
         shutil.copy(SIMPLE_FASTA, dst)
         r = run("sketch", "-k", "4", "-d", "256", "-m", "64", dst)
         assert r.returncode == 0, r.stderr
-        assert os.path.exists(str(tmp_path / "simple.hms"))
+        assert os.path.exists(str(tmp_path / "simple.hs"))
 
     def test_sketch_ambiguous_bases_do_not_crash(self, tmp_path):
         out = str(tmp_path / "out")
@@ -144,7 +144,7 @@ class TestSketchCommand:
     def test_sketch_custom_parameters_are_stored(self, tmp_path):
         out = str(tmp_path / "out")
         run("sketch", "-k", "7", "-d", "512", "-m", "128", "-o", out, SIMPLE_FASTA)
-        r = run("info", out + ".hms")
+        r = run("info", out + ".hs")
         assert "7"   in r.stdout  # k
         assert "512" in r.stdout  # D
         assert "128" in r.stdout  # M
@@ -164,7 +164,7 @@ def two_sketches(tmp_path_factory):
             [BINARY, "sketch", "-k", "4", "-d", "256", "-m", "64", "-o", out, fasta],
             check=True, capture_output=True,
         )
-        return out + ".hms"
+        return out + ".hs"
     return sketch("simple", SIMPLE_FASTA), sketch("different", DIFFERENT_FASTA)
 
 
@@ -196,7 +196,7 @@ class TestDistCommand:
 
     def test_dist_missing_sketch_exits_non_zero(self, two_sketches):
         s1, _ = two_sketches
-        assert run("dist", s1, "/nonexistent/path.hms").returncode != 0
+        assert run("dist", s1, "/nonexistent/path.hs").returncode != 0
 
     def test_dist_single_file_exits_non_zero(self, two_sketches):
         s1, _ = two_sketches
@@ -233,7 +233,7 @@ class TestInfoCommand:
             [BINARY, "sketch", "-k", "4", "-d", "256", "-m", "64", "-o", out, SIMPLE_FASTA],
             check=True, capture_output=True,
         )
-        return out + ".hms"
+        return out + ".hs"
 
     def test_info_exits_zero(self, sketch_file):
         assert run("info", sketch_file).returncode == 0
@@ -252,10 +252,10 @@ class TestInfoCommand:
         assert re.search(r"\b64\b",  r.stdout)
 
     def test_info_missing_file_exits_non_zero(self):
-        assert run("info", "/nonexistent/path.hms").returncode != 0
+        assert run("info", "/nonexistent/path.hs").returncode != 0
 
     def test_info_invalid_file_exits_non_zero(self, tmp_path):
-        bad = tmp_path / "bad.hms"
+        bad = tmp_path / "bad.hs"
         bad.write_bytes(b"not a valid hms file at all")
         assert run("info", str(bad)).returncode != 0
 
@@ -272,7 +272,7 @@ class TestRecallCommand:
             [BINARY, "sketch", "-k", "4", "-d", "256", "-m", "64", "-o", out, SIMPLE_FASTA],
             check=True, capture_output=True,
         )
-        return out + ".hms", SIMPLE_FASTA
+        return out + ".hs", SIMPLE_FASTA
 
     def test_recall_exits_zero(self, sketch_and_fasta):
         hms, fna = sketch_and_fasta
@@ -292,4 +292,4 @@ class TestRecallCommand:
         assert 0.0 <= recall_val <= 1.0
 
     def test_recall_missing_sketch_exits_non_zero(self):
-        assert run("recall", "/nonexistent.hms", SIMPLE_FASTA).returncode != 0
+        assert run("recall", "/nonexistent.hs", SIMPLE_FASTA).returncode != 0

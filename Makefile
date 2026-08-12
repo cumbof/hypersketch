@@ -40,4 +40,4 @@ test: test-unit test-integration
 # Clean
 # ---------------------------------------------------------------------------
 clean:
-	rm -f hypersketch tests/test_unit tests/fixtures/*.hms
+	rm -f hypersketch tests/test_unit tests/fixtures/*.hs

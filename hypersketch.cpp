@@ -641,7 +641,7 @@ void handle_sketch(const std::vector<std::string>& args) {
         else if (args[i] == "-d" && i + 1 < args.size()) { D = std::stoi(args[++i]); }
         else if (args[i] == "-m" && i + 1 < args.size()) { M = std::stoul(args[++i]); }
         else if (args[i] == "-t" && i + 1 < args.size()) { num_threads = std::stoi(args[++i]); }
-        else if (args[i] == "-o" && i + 1 < args.size()) { output_file = args[++i] + ".hms"; }
+        else if (args[i] == "-o" && i + 1 < args.size()) { output_file = args[++i] + ".hs"; }
         else if (args[i][0] != '-') { 
             if (!input_file.empty()) throw std::runtime_error("Only one input FASTA file is allowed.");
             input_file = args[i]; 
@@ -658,7 +658,7 @@ void handle_sketch(const std::vector<std::string>& args) {
         std::string basename = input_file;
         size_t pos = basename.find_last_of(".");
         if (pos != std::string::npos) basename = basename.substr(0, pos);
-        output_file = basename + ".hms";
+        output_file = basename + ".hs";
     }
 
     HashedGraphEncoder encoder(k, D, M);
@@ -846,7 +846,7 @@ void handle_dist(const std::vector<std::string>& args) {
 }
 
 void handle_recall(const std::vector<std::string>& args) {
-    if (args.size() != 4) throw std::runtime_error("Usage: hypersketch recall <sketch.hms> <genome.fna>");
+    if (args.size() != 4) throw std::runtime_error("Usage: hypersketch recall <sketch.hs> <genome.fna>");
     std::string sketch_file = args[2];
     std::string fasta_file = args[3];
 

@@ -107,7 +107,7 @@ Options:
 
 - __I/O:__ Fully asynchronous batch processing via Matrix Job Generation (bypasses ARG_MAX terminal limits using the -l list flag).
 
-- __Storage:__ Final .hms files are aggressively bit-packed (8 dimensions per byte) using 8-way unrolled OR-gates, achieving a 32x compression ratio over raw integers.
+- __Storage:__ Final .hs files are aggressively bit-packed (8 dimensions per byte) using 8-way unrolled OR-gates, achieving a 32x compression ratio over raw integers.
 
 ## Credits
 
